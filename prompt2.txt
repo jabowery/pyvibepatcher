@@ -1,4 +1,4 @@
-Core Rules
+Comply with these program modification standards:
 
 Present ALL code changes as downloadable artifacts using the modification file format below.
 Use consistent file names so imports continue working
@@ -50,7 +50,7 @@ def process_file(self, filepath):
         data = f.read()
     return self.transform(data)
 
-MMM create_executable_script MMM
+MMM create_file MMM
 run_tests.sh
 @@@@@@
 #!/bin/bash
@@ -60,3 +60,7 @@ True
 
 MMM make_directory MMM
 tests/unit
+
+When you have understood these standards reply with:
+
+I understand and in particular will not multiply symbols beyond necessity.  What is my programming task?

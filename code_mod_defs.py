@@ -120,18 +120,18 @@ class GitRollbackManager:
     
     def create_rollback_point(self, message=None, force_commit=False):
         """
-    Create a git commit as a rollback point
-    
-    Args:
-        message: Commit message (auto-generated if None)
-        force_commit: If True, commit even if no changes exist
+        Create a git commit as a rollback point
         
-    Returns:
-        dict: Rollback information including commit hash, branch, timestamp
-        
-    Raises:
-        RuntimeError: If rollback point cannot be created
-    """
+        Args:
+            message: Commit message (auto-generated if None)
+            force_commit: If True, commit even if no changes exist
+            
+        Returns:
+            dict: Rollback information including commit hash, branch, timestamp
+            
+        Raises:
+            RuntimeError: If rollback point cannot be created
+        """
         if not self.is_git_repo():
             raise RuntimeError("Not in a git repository - rollback required for file modifications")
         
@@ -141,6 +141,16 @@ class GitRollbackManager:
         
         current_commit = self.get_current_commit()
         current_branch = self.get_current_branch()
+        
+        if not current_commit:
+            raise RuntimeError("Failed to get current git commit hash")
+        
+        # Check git configuration
+        try:
+            subprocess.run(['git', 'config', 'user.name'], check=True, capture_output=True)
+            subprocess.run(['git', 'config', 'user.email'], check=True, capture_output=True)
+        except subprocess.CalledProcessError:
+            raise RuntimeError("Git user.name and user.email must be configured")
         
         # Add only tracked files to staging
         if self.tracked_files:
@@ -156,7 +166,9 @@ class GitRollbackManager:
                         raise RuntimeError(f"Failed to stage deleted file {file_path}: {result.stderr.decode()}")
         
         # Check if there's anything to commit
-        if not self.has_uncommitted_changes() and not force_commit:
+        has_changes = self.has_uncommitted_changes()
+        
+        if not has_changes and not force_commit:
             logging.info("No changes to commit, using current HEAD as rollback point")
             rollback_info = {
                 'commit_hash': current_commit,
@@ -166,12 +178,22 @@ class GitRollbackManager:
                 'was_clean': True
             }
         else:
-            # Create commit
-            result = subprocess.run(['git', 'commit', '-m', message], capture_output=True)
+            if not has_changes:
+                # force_commit=True but no changes - create empty commit
+                result = subprocess.run(['git', 'commit', '--allow-empty', '-m', message], capture_output=True)
+            else:
+                # Normal commit with changes
+                result = subprocess.run(['git', 'commit', '-m', message], capture_output=True)
+            
             if result.returncode != 0:
-                raise RuntimeError(f"Failed to create git commit: {result.stderr.decode()}")
+                stderr_msg = result.stderr.decode().strip()
+                stdout_msg = result.stdout.decode().strip()
+                error_details = f"stderr: {stderr_msg}, stdout: {stdout_msg}" if stderr_msg or stdout_msg else "no error details provided"
+                raise RuntimeError(f"Failed to create git commit: {error_details}")
             
             new_commit = self.get_current_commit()
+            if not new_commit:
+                raise RuntimeError("Failed to get commit hash after successful commit")
             
             rollback_info = {
                 'commit_hash': new_commit,
@@ -187,7 +209,7 @@ class GitRollbackManager:
         
         logging.info(f"Created rollback point: {rollback_info['commit_hash']}")
         return rollback_info
-    
+
     def soft_rollback(self, commit_hash=None):
         """
         Soft rollback - reset to commit but keep changes staged
@@ -387,7 +409,7 @@ class ReplaceDefOrClass(cst.CSTTransformer):
         mod = cst.parse_module(new_code)
         if len(mod.body) != 1:
             raise ValueError("new_code must contain exactly one top-level def/class.")
-        self.replacement = mod.body[0]
+        self.replacement = mod.body[0] #
         if kind is None:
             if isinstance(self.replacement, cst.FunctionDef):
                 kind = "def"
