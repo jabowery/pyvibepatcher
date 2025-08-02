@@ -77,47 +77,15 @@ class GitRollbackManager:
         self.rollback_file = rollback_file
         self.rollback_data = {}
         self.tracked_files = set()
-
-    def track_file(self, file_path):
-        """Track a file for inclusion in git commits"""
-        self.tracked_files.add(file_path)
-    
-    def is_git_repo(self):
-        """Check if current directory is a git repository"""
+    def has_staged_changes(self):
+        """Check if there are staged changes ready to commit"""
         try:
-            subprocess.run(['git', 'rev-parse', '--git-dir'], 
-                         check=True, capture_output=True)
-            return True
-        except subprocess.CalledProcessError:
-            return False
-    
-    def get_current_commit(self):
-        """Get current commit hash"""
-        try:
-            result = subprocess.run(['git', 'rev-parse', 'HEAD'], 
-                                  check=True, capture_output=True, text=True)
-            return result.stdout.strip()
-        except subprocess.CalledProcessError:
-            return None
-    
-    def get_current_branch(self):
-        """Get current branch name"""
-        try:
-            result = subprocess.run(['git', 'branch', '--show-current'], 
-                                  check=True, capture_output=True, text=True)
-            return result.stdout.strip()
-        except subprocess.CalledProcessError:
-            return None
-    
-    def has_uncommitted_changes(self):
-        """Check if there are uncommitted changes"""
-        try:
-            result = subprocess.run(['git', 'status', '--porcelain'], 
+            result = subprocess.run(['git', 'diff', '--cached', '--name-only'], 
                                   check=True, capture_output=True, text=True)
             return bool(result.stdout.strip())
         except subprocess.CalledProcessError:
             return False
-    
+
     def create_rollback_point(self, message=None, force_commit=False):
         """
         Create a git commit as a rollback point
@@ -165,11 +133,11 @@ class GitRollbackManager:
                     if result.returncode != 0:
                         raise RuntimeError(f"Failed to stage deleted file {file_path}: {result.stderr.decode()}")
         
-        # Check if there's anything to commit
-        has_changes = self.has_uncommitted_changes()
+        # Check if there are staged changes to commit
+        has_staged = self.has_staged_changes()
         
-        if not has_changes and not force_commit:
-            logging.info("No changes to commit, using current HEAD as rollback point")
+        if not has_staged and not force_commit:
+            logging.info("No staged changes, using current HEAD as rollback point")
             rollback_info = {
                 'commit_hash': current_commit,
                 'branch': current_branch,
@@ -178,11 +146,11 @@ class GitRollbackManager:
                 'was_clean': True
             }
         else:
-            if not has_changes:
-                # force_commit=True but no changes - create empty commit
+            if not has_staged:
+                # force_commit=True but no staged changes - create empty commit
                 result = subprocess.run(['git', 'commit', '--allow-empty', '-m', message], capture_output=True)
             else:
-                # Normal commit with changes
+                # Normal commit with staged changes
                 result = subprocess.run(['git', 'commit', '-m', message], capture_output=True)
             
             if result.returncode != 0:
@@ -209,6 +177,47 @@ class GitRollbackManager:
         
         logging.info(f"Created rollback point: {rollback_info['commit_hash']}")
         return rollback_info
+
+    def track_file(self, file_path):
+        """Track a file for inclusion in git commits"""
+        self.tracked_files.add(file_path)
+    
+    def is_git_repo(self):
+        """Check if current directory is a git repository"""
+        try:
+            subprocess.run(['git', 'rev-parse', '--git-dir'], 
+                         check=True, capture_output=True)
+            return True
+        except subprocess.CalledProcessError:
+            return False
+    
+    def get_current_commit(self):
+        """Get current commit hash"""
+        try:
+            result = subprocess.run(['git', 'rev-parse', 'HEAD'], 
+                                  check=True, capture_output=True, text=True)
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return None
+    
+    def get_current_branch(self):
+        """Get current branch name"""
+        try:
+            result = subprocess.run(['git', 'branch', '--show-current'], 
+                                  check=True, capture_output=True, text=True)
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return None
+    
+    def has_uncommitted_changes(self):
+        """Check if there are uncommitted changes"""
+        try:
+            result = subprocess.run(['git', 'status', '--porcelain'], 
+                                  check=True, capture_output=True, text=True)
+            return bool(result.stdout.strip())
+        except subprocess.CalledProcessError:
+            return False
+    
 
     def soft_rollback(self, commit_hash=None):
         """
