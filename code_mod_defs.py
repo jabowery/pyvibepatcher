@@ -492,7 +492,8 @@ def insert_block(content: str,
 
 def replace_function_class(file_path, target_path, new_code):
     """
-    Replace a function or class in a file with new code using lexical chain support
+    Replace a function or class in a file with new code using lexical chain support.
+    If the target doesn't exist, insert it in the appropriate location.
     
     Args:
         file_path: Path to the Python file
@@ -503,12 +504,19 @@ def replace_function_class(file_path, target_path, new_code):
         content = f.read()
     
     target_name, lexical_chain = parse_lexical_chain(target_path)
+    
+    # Try replacement first
     new_content = replace_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+    
+    # Check if replacement actually happened by comparing content
+    if new_content == content:
+        # Target not found, insert instead
+        new_content = insert_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
 
     with open(file_path, 'w') as f:
         f.write(new_content)
     
-    logging.debug(f"Replaced {target_path} in {file_path}")
+    logging.debug(f"Modified {target_path} in {file_path}")
 
 def search_replace_line(file_path, search_text, replacement_text):
     """Search for a line and replace it"""
