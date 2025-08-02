@@ -15,61 +15,6 @@ from typing import Optional, List
 
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
 
-class InsertIntoContainer(cst.CSTTransformer):
-    """Insert a node into a specific container in the AST"""
-    
-    def __init__(self, node_to_insert: cst.BaseStatement, lexical_chain: List[str]):
-        self.node_to_insert = node_to_insert
-        self.lexical_chain = lexical_chain
-        self.context_stack: List[str] = []
-        self.inserted = False
-
-    def visit_ClassDef(self, node: cst.ClassDef) -> bool:
-        self.context_stack.append(node.name.value)
-        return True
-
-    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
-        self.context_stack.append(node.name.value)
-        return True
-
-    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.BaseStatement:
-        current_name = self.context_stack.pop()
-        
-        # Insert into this class if it matches our target chain
-        if (not self.inserted and 
-            self._matches_insertion_point() and
-            isinstance(self.node_to_insert, cst.FunctionDef)):
-            
-            # Insert the method at the end of the class body
-            new_body = list(updated_node.body.body) + [self.node_to_insert]
-            updated_node = updated_node.with_changes(
-                body=updated_node.body.with_changes(body=new_body)
-            )
-            self.inserted = True
-            
-        return updated_node
-
-    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.BaseStatement:
-        current_name = self.context_stack.pop()
-        
-        # Insert into this function if it matches our target chain
-        if (not self.inserted and 
-            self._matches_insertion_point() and
-            isinstance(self.node_to_insert, cst.FunctionDef)):
-            
-            # Insert the nested function at the end of the function body
-            new_body = list(updated_node.body.body) + [self.node_to_insert]
-            updated_node = updated_node.with_changes(
-                body=updated_node.body.with_changes(body=new_body)
-            )
-            self.inserted = True
-            
-        return updated_node
-
-    def _matches_insertion_point(self) -> bool:
-        """Check if current context matches where we want to insert"""
-        return self.context_stack == self.lexical_chain
-
 class GitRollbackManager:
     """Manages git-based rollback operations for code modifications"""
     
@@ -345,30 +290,14 @@ class GitRollbackManager:
 
 # pip install libcst
 
-def parse_lexical_chain(target_path: str) -> tuple[str, List[str]]:
-    """
-    Parse a lexical chain like 'ClassName.method_name' or 'outer_func.inner_func'
-    
-    Args:
-        target_path: Dot-separated path like 'ClassName.method_name'
-        
-    Returns:
-        tuple: (final_target_name, list_of_container_names)
-    """
-    parts = target_path.split('.')
-    if len(parts) == 1:
-        return parts[0], []
-    
-    return parts[-1], parts[:-1]
-
 class ReplaceDefOrClass(cst.CSTTransformer):
     def __init__(self, target_name: str, new_code: str,
-                 kind: Optional[str] = None, lexical_chain: Optional[List[str]] = None):
+                 kind: Optional[str] = None, within_class: Optional[str] = None):
         """
         target_name: name of function or class to replace.
         new_code: the full new def/class code (including decorators if any).
         kind: "def" or "class" (if None, inferred from new_code).
-        lexical_chain: list of container names to traverse (e.g., ['ClassName'] for ClassName.method_name)
+        within_class: only replace when inside this class (for methods).
         """
         mod = cst.parse_module(new_code)
         if len(mod.body) != 1:
@@ -383,57 +312,43 @@ class ReplaceDefOrClass(cst.CSTTransformer):
                 raise ValueError("new_code must be a function or class definition.")
         self.kind = kind
         self.target_name = target_name
-        self.lexical_chain = lexical_chain or []
-        self.context_stack: List[str] = []
+        self.within_class = within_class
+        self.class_stack: List[str] = []
 
+    # Track current class nesting so we can target only a method in a specific class.
     def visit_ClassDef(self, node: cst.ClassDef) -> bool:
-        self.context_stack.append(node.name.value)
-        return True
-
-    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
-        self.context_stack.append(node.name.value)
+        self.class_stack.append(node.name.value)
         return True
 
     def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.BaseStatement:
-        current_name = self.context_stack.pop()
-        
-        # Replace class definition if it matches
-        if (self.kind == "class" 
+        self.class_stack.pop()
+        # Optionally replace a class definition itself:
+        if (self.kind == "class"
             and original_node.name.value == self.target_name
-            and self._matches_lexical_chain()):
+            and (self.within_class is None)):  # replacing the class itself, not inside another
+            # Preserve leading comments/blank lines
             return self.replacement.with_changes(leading_lines=original_node.leading_lines)
         return updated_node
 
     def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.BaseStatement:
-        current_name = self.context_stack.pop()
-        
-        # Replace function definition if it matches
-        if (self.kind == "def"
-            and original_node.name.value == self.target_name
-            and self._matches_lexical_chain()):
-            return self.replacement.with_changes(leading_lines=original_node.leading_lines)
-        return updated_node
-
-    def _matches_lexical_chain(self) -> bool:
-        """Check if current context matches the required lexical chain"""
-        if not self.lexical_chain:
-            return True
-        
-        if len(self.context_stack) < len(self.lexical_chain):
-            return False
-        
-        # Check if the chain matches from the end
-        return self.context_stack[-len(self.lexical_chain):] == self.lexical_chain
+        if self.kind != "def":
+            return updated_node
+        if original_node.name.value != self.target_name:
+            return updated_node
+        if self.within_class is not None and self.within_class not in self.class_stack:
+            return updated_node
+        # Replace the function, preserving leading comments/blank lines
+        return self.replacement.with_changes(leading_lines=original_node.leading_lines)
 
 def replace_block(content: str,
-                  new_code: str,
-                  target_name: Optional[str] = None,
-                  kind: Optional[str] = None,
-                  lexical_chain: Optional[List[str]] = None) -> str:
+                              new_code: str,
+                              target_name: Optional[str] = None,
+                              kind: Optional[str] = None,
+                              within_class: Optional[str] = None) -> str:
     """
     Replace a function or class in `content` with `new_code` using LibCST.
     - If `target_name`/`kind` are omitted, they are inferred from `new_code`.
-    - lexical_chain specifies the containment hierarchy (e.g., ['ClassName'] for a method)
+    - If `within_class` is provided, only replace a method inside that class.
     """
     # Infer target_name/kind from new_code if not provided
     mod = cst.parse_module(new_code)
@@ -449,66 +364,24 @@ def replace_block(content: str,
     target_name = target_name or inferred_name
 
     module = cst.parse_module(content)
-    new_module = module.visit(ReplaceDefOrClass(target_name, new_code, kind=kind, lexical_chain=lexical_chain))
-    return new_module.code
-
-def insert_block(content: str,
-                 new_code: str,
-                 target_name: Optional[str] = None,
-                 lexical_chain: Optional[List[str]] = None) -> str:
-    """
-    Insert a function or class into content at the appropriate location.
-
-    Args:
-        content: Source code content
-        new_code: New function/class code to insert
-        target_name: Name of the function/class to insert
-        lexical_chain: Container hierarchy for nested insertion
-
-    Returns:
-        Modified content with inserted code
-    """
-    # Parse the new code to determine what we're inserting
-    mod = cst.parse_module(new_code)
-    if len(mod.body) != 1:
-        raise ValueError("new_code must contain exactly one top-level def/class.")
-
-    node = mod.body[0]
-    is_class = isinstance(node, cst.ClassDef)
-
-    module = cst.parse_module(content)
-
-    if not lexical_chain:
-        # Top-level insertion - append at end of module
-        new_module = module.with_changes(
-            body=list(module.body) + [node]
-        )
-    else:
-        # Nested insertion - insert into specific container
-        new_module = module.visit(InsertIntoContainer(node, lexical_chain))
-
+    new_module = module.visit(ReplaceDefOrClass(target_name, new_code, kind=kind, within_class=within_class))
     return new_module.code
 
 
-def replace_function_class(file_path, target_path, new_code):
-    """
-    Replace a function or class in a file with new code using lexical chain support
-    
-    Args:
-        file_path: Path to the Python file
-        target_path: Target path like 'function_name' or 'ClassName.method_name'
-        new_code: New function/class code to replace with
-    """
+
+# Original modification functions
+def replace_function_class(file_path, target_name, new_code):
+    """Replace a function or class in a file with new code"""
     with open(file_path, 'r') as f:
         content = f.read()
     
-    target_name, lexical_chain = parse_lexical_chain(target_path)
-    new_content = replace_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+    #new_content = replace_block(content, new_code, target_name)
+    new_content = replace_block(content, new_code, target_name=target_name,)
 
     with open(file_path, 'w') as f:
         f.write(new_content)
     
-    logging.debug(f"Replaced {target_path} in {file_path}")
+    logging.debug(f"Replaced {target_name} in {file_path}")
 
 def search_replace_line(file_path, search_text, replacement_text):
     """Search for a line and replace it"""
@@ -556,7 +429,7 @@ def remove_file(path, recursive=False):
 
 def apply_modification_set(modifications, auto_rollback_on_failure=True):
     """
-    Apply a set of modifications with rollback support
+    Apply a set of modifications with comprehensive rollback support
     
     Args:
         modifications: List of (function, args, kwargs) tuples

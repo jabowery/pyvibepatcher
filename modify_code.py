@@ -25,7 +25,7 @@ def parse_modification_file(file_path):
         function_name = function_blocks[i].strip()
         block_content = function_blocks[i + 1].strip()
         
-        # Split arguments by @@@@@@ or @@@ @@@
+        # Split arguments by @@@@@@
         args = re.split(r'@{6}|@{3}\s@{3}', block_content)
         args = [arg.strip() for arg in args if arg.strip()]
         

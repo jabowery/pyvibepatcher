@@ -15,61 +15,6 @@ from typing import Optional, List
 
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
 
-class InsertIntoContainer(cst.CSTTransformer):
-    """Insert a node into a specific container in the AST"""
-    
-    def __init__(self, node_to_insert: cst.BaseStatement, lexical_chain: List[str]):
-        self.node_to_insert = node_to_insert
-        self.lexical_chain = lexical_chain
-        self.context_stack: List[str] = []
-        self.inserted = False
-
-    def visit_ClassDef(self, node: cst.ClassDef) -> bool:
-        self.context_stack.append(node.name.value)
-        return True
-
-    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
-        self.context_stack.append(node.name.value)
-        return True
-
-    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.BaseStatement:
-        current_name = self.context_stack.pop()
-        
-        # Insert into this class if it matches our target chain
-        if (not self.inserted and 
-            self._matches_insertion_point() and
-            isinstance(self.node_to_insert, cst.FunctionDef)):
-            
-            # Insert the method at the end of the class body
-            new_body = list(updated_node.body.body) + [self.node_to_insert]
-            updated_node = updated_node.with_changes(
-                body=updated_node.body.with_changes(body=new_body)
-            )
-            self.inserted = True
-            
-        return updated_node
-
-    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.BaseStatement:
-        current_name = self.context_stack.pop()
-        
-        # Insert into this function if it matches our target chain
-        if (not self.inserted and 
-            self._matches_insertion_point() and
-            isinstance(self.node_to_insert, cst.FunctionDef)):
-            
-            # Insert the nested function at the end of the function body
-            new_body = list(updated_node.body.body) + [self.node_to_insert]
-            updated_node = updated_node.with_changes(
-                body=updated_node.body.with_changes(body=new_body)
-            )
-            self.inserted = True
-            
-        return updated_node
-
-    def _matches_insertion_point(self) -> bool:
-        """Check if current context matches where we want to insert"""
-        return self.context_stack == self.lexical_chain
-
 class GitRollbackManager:
     """Manages git-based rollback operations for code modifications"""
     
@@ -451,44 +396,6 @@ def replace_block(content: str,
     module = cst.parse_module(content)
     new_module = module.visit(ReplaceDefOrClass(target_name, new_code, kind=kind, lexical_chain=lexical_chain))
     return new_module.code
-
-def insert_block(content: str,
-                 new_code: str,
-                 target_name: Optional[str] = None,
-                 lexical_chain: Optional[List[str]] = None) -> str:
-    """
-    Insert a function or class into content at the appropriate location.
-
-    Args:
-        content: Source code content
-        new_code: New function/class code to insert
-        target_name: Name of the function/class to insert
-        lexical_chain: Container hierarchy for nested insertion
-
-    Returns:
-        Modified content with inserted code
-    """
-    # Parse the new code to determine what we're inserting
-    mod = cst.parse_module(new_code)
-    if len(mod.body) != 1:
-        raise ValueError("new_code must contain exactly one top-level def/class.")
-
-    node = mod.body[0]
-    is_class = isinstance(node, cst.ClassDef)
-
-    module = cst.parse_module(content)
-
-    if not lexical_chain:
-        # Top-level insertion - append at end of module
-        new_module = module.with_changes(
-            body=list(module.body) + [node]
-        )
-    else:
-        # Nested insertion - insert into specific container
-        new_module = module.visit(InsertIntoContainer(node, lexical_chain))
-
-    return new_module.code
-
 
 def replace_function_class(file_path, target_path, new_code):
     """
