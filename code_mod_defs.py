@@ -76,6 +76,11 @@ class GitRollbackManager:
     def __init__(self, rollback_file='.modification_rollback.json'):
         self.rollback_file = rollback_file
         self.rollback_data = {}
+        self.tracked_files = set()
+
+    def track_file(self, file_path):
+        """Track a file for inclusion in git commits"""
+        self.tracked_files.add(file_path)
     
     def is_git_repo(self):
         """Check if current directory is a git repository"""
@@ -115,18 +120,20 @@ class GitRollbackManager:
     
     def create_rollback_point(self, message=None, force_commit=False):
         """
-        Create a git commit as a rollback point
+    Create a git commit as a rollback point
+    
+    Args:
+        message: Commit message (auto-generated if None)
+        force_commit: If True, commit even if no changes exist
         
-        Args:
-            message: Commit message (auto-generated if None)
-            force_commit: If True, commit even if no changes exist
-            
-        Returns:
-            dict: Rollback information including commit hash, branch, timestamp
-        """
+    Returns:
+        dict: Rollback information including commit hash, branch, timestamp
+        
+    Raises:
+        RuntimeError: If rollback point cannot be created
+    """
         if not self.is_git_repo():
-            logging.warning("Not in a git repository - rollback not available")
-            return None
+            raise RuntimeError("Not in a git repository - rollback required for file modifications")
         
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         if message is None:
@@ -135,44 +142,51 @@ class GitRollbackManager:
         current_commit = self.get_current_commit()
         current_branch = self.get_current_branch()
         
-        try:
-            # Add all changes to staging
-            subprocess.run(['git', 'add', '-A'], check=True, capture_output=True)
+        # Add only tracked files to staging
+        if self.tracked_files:
+            for file_path in self.tracked_files:
+                if os.path.exists(file_path):
+                    result = subprocess.run(['git', 'add', file_path], capture_output=True)
+                    if result.returncode != 0:
+                        raise RuntimeError(f"Failed to stage file {file_path}: {result.stderr.decode()}")
+                else:
+                    # File was deleted, add it for removal
+                    result = subprocess.run(['git', 'add', file_path], capture_output=True)
+                    if result.returncode != 0:
+                        raise RuntimeError(f"Failed to stage deleted file {file_path}: {result.stderr.decode()}")
+        
+        # Check if there's anything to commit
+        if not self.has_uncommitted_changes() and not force_commit:
+            logging.info("No changes to commit, using current HEAD as rollback point")
+            rollback_info = {
+                'commit_hash': current_commit,
+                'branch': current_branch,
+                'timestamp': timestamp,
+                'message': f"Rollback point (no changes): {message}",
+                'was_clean': True
+            }
+        else:
+            # Create commit
+            result = subprocess.run(['git', 'commit', '-m', message], capture_output=True)
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to create git commit: {result.stderr.decode()}")
             
-            # Check if there's anything to commit
-            if not self.has_uncommitted_changes() and not force_commit:
-                logging.info("No changes to commit, using current HEAD as rollback point")
-                rollback_info = {
-                    'commit_hash': current_commit,
-                    'branch': current_branch,
-                    'timestamp': timestamp,
-                    'message': f"Rollback point (no changes): {message}",
-                    'was_clean': True
-                }
-            else:
-                # Create commit
-                subprocess.run(['git', 'commit', '-m', message], 
-                             check=True, capture_output=True)
-                new_commit = self.get_current_commit()
-                
-                rollback_info = {
-                    'commit_hash': new_commit,
-                    'branch': current_branch,
-                    'timestamp': timestamp,
-                    'message': message,
-                    'was_clean': False
-                }
+            new_commit = self.get_current_commit()
             
-            # Save rollback info to file
-            self.rollback_data = rollback_info
-            self._save_rollback_data()
-            
-            logging.info(f"Created rollback point: {rollback_info['commit_hash']}")
-            return rollback_info
-            
-        except subprocess.CalledProcessError as e:
-            logging.error(f"Could not create git commit: {e}")
-            return None
+            rollback_info = {
+                'commit_hash': new_commit,
+                'branch': current_branch,
+                'timestamp': timestamp,
+                'message': message,
+                'was_clean': False
+            }
+        
+        # Save rollback info to file
+        self.rollback_data = rollback_info
+        self._save_rollback_data()
+        
+        logging.info(f"Created rollback point: {rollback_info['commit_hash']}")
+        return rollback_info
     
     def soft_rollback(self, commit_hash=None):
         """
@@ -438,6 +452,7 @@ def replace_block(content: str,
     # Infer target_name/kind from new_code if not provided
     mod = cst.parse_module(new_code)
     if len(mod.body) != 1:
+        breakpoint()
         raise ValueError("new_code must contain exactly one top-level def/class.")
     node = mod.body[0]
     inferred_kind = "def" if isinstance(node, cst.FunctionDef) else "class" if isinstance(node, cst.ClassDef) else None
@@ -516,6 +531,10 @@ def replace_function_class(file_path, target_path, new_code):
     with open(file_path, 'w') as f:
         f.write(new_content)
     
+    # Track file for git operations
+    if hasattr(replace_function_class, '_rollback_manager'):
+        replace_function_class._rollback_manager.track_file(file_path)
+    
     logging.debug(f"Modified {target_path} in {file_path}")
 
 def search_replace_line(file_path, search_text, replacement_text):
@@ -536,10 +555,19 @@ def search_replace_line(file_path, search_text, replacement_text):
     with open(file_path, 'w') as f:
         f.writelines(lines)
     
+    # Track file for git operations
+    if hasattr(search_replace_line, '_rollback_manager'):
+        search_replace_line._rollback_manager.track_file(file_path)
+    
     logging.debug(f"Replaced line containing '{search_text}' in {file_path}")
 
 def move_file(src, dst):
     """Move/rename file or directory"""
+    # Track both source and destination for git operations
+    if hasattr(move_file, '_rollback_manager'):
+        move_file._rollback_manager.track_file(src)
+        move_file._rollback_manager.track_file(dst)
+    
     shutil.move(src, dst)
     logging.debug(f"Moved {src} to {dst}")
 
@@ -550,6 +578,10 @@ def make_directory(path):
 
 def remove_file(path, recursive=False):
     """Remove file or directory"""
+    # Track file for git operations before removal
+    if hasattr(remove_file, '_rollback_manager'):
+        remove_file._rollback_manager.track_file(path)
+    
     if recursive and os.path.isdir(path):
         shutil.rmtree(path)
         logging.debug(f"Removed directory {path} recursively")
@@ -572,38 +604,58 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
         
     Returns:
         GitRollbackManager: Manager instance for manual rollback operations
+        
+    Raises:
+        RuntimeError: If rollback capability cannot be established
     """
     rollback_manager = GitRollbackManager()
     
-    # Create rollback point
-    rollback_info = rollback_manager.create_rollback_point("Before LLM modifications")
+    # Set rollback manager on modification functions
+    replace_function_class._rollback_manager = rollback_manager
+    search_replace_line._rollback_manager = rollback_manager
+    move_file._rollback_manager = rollback_manager
+    remove_file._rollback_manager = rollback_manager
+    create_file._rollback_manager = rollback_manager
     
-    if not rollback_info:
-        logging.warning("Proceeding without git rollback capability")
+    # Create rollback point - this will raise if it fails
+    rollback_info = rollback_manager.create_rollback_point("Before LLM modifications")
     
     try:
         # Apply all modifications
         for func, args, kwargs in modifications:
             func(*args, **kwargs)
         
+        # Create final commit with tracked files
+        if rollback_manager.tracked_files:
+            rollback_manager.create_rollback_point("After LLM modifications", force_commit=True)
+        
         logging.info("All modifications completed successfully")
-        
-        if rollback_info:
-            rollback_manager.show_rollback_options()
-        
+        rollback_manager.show_rollback_options()
         return rollback_manager
         
     except Exception as e:
         logging.error(f"Modifications failed: {e}")
         
-        if auto_rollback_on_failure and rollback_info:
+        if auto_rollback_on_failure:
             logging.info("Auto-rolling back due to failure...")
             rollback_manager.hard_rollback()
-        elif rollback_info:
+        else:
             logging.info("Manual rollback available - use returned manager")
             rollback_manager.show_rollback_options()
         
         raise
+    finally:
+        # Clean up rollback manager references
+        if hasattr(replace_function_class, '_rollback_manager'):
+            del replace_function_class._rollback_manager
+        if hasattr(search_replace_line, '_rollback_manager'):
+            del search_replace_line._rollback_manager
+        if hasattr(move_file, '_rollback_manager'):
+            del move_file._rollback_manager
+        if hasattr(remove_file, '_rollback_manager'):
+            del remove_file._rollback_manager
+        if hasattr(create_file, '_rollback_manager'):
+            del create_file._rollback_manager
 
 # Interactive rollback interface
 def interactive_rollback():
@@ -659,6 +711,10 @@ def create_file(file_path, file_content, make_executable=True):
         # Add executable permissions for owner, group, and others
         current_permissions = os.stat(file_path).st_mode
         os.chmod(file_path, current_permissions | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    
+    # Track file for git operations
+    if hasattr(create_file, '_rollback_manager'):
+        create_file._rollback_manager.track_file(file_path)
     
     logging.debug(f"Created {'executable script' if make_executable else 'file'} {file_path}")
 
