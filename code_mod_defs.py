@@ -642,6 +642,26 @@ def interactive_rollback():
         else:
             print("Invalid choice")
 
+def create_file(file_path, file_content, make_executable=True):
+    """Create a file
+    
+    Args:
+        file_path: Path where script should be created
+        file_content: Content of the script
+        make_executable: If True, set executable permissions (Unix/Linux/Mac)
+    """
+    import stat
+    
+    with open(file_path, 'w') as f:
+        f.write(file_content)
+    
+    if make_executable:
+        # Add executable permissions for owner, group, and others
+        current_permissions = os.stat(file_path).st_mode
+        os.chmod(file_path, current_permissions | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    
+    logging.debug(f"Created {'executable script' if make_executable else 'file'} {file_path}")
+
 # Example usage
 if __name__ == "__main__":
     import sys
