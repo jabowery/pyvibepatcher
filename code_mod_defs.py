@@ -725,6 +725,32 @@ def interactive_rollback():
         else:
             print("Invalid choice")
 
+def open_with_mkdir(filepath, mode='w', **kwargs):
+    """
+    Opens a file at the given filepath, creating any necessary intermediate directories if they don't exist.
+    
+    Args:
+    filepath (str): The path to the file to open.
+    mode (str): The mode in which to open the file (default: 'w' for write).
+    **kwargs: Additional keyword arguments to pass to the built-in open() function.
+    
+    Returns:
+    file: An open file object.
+    
+    Example:
+    >>> with open_with_mkdir('path/to/new/dir/file.txt', 'w') as f:
+    ...     f.write('Hello, world!')
+    """
+    # Extract the directory from the filepath
+    directory = os.path.dirname(filepath)
+    
+    # Create the directory if it doesn't exist
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    
+    # Open and return the file object
+    return open(filepath, mode=mode, **kwargs)
+
 def create_file(file_path, file_content, make_executable=True):
     """Create a file
     
@@ -735,7 +761,8 @@ def create_file(file_path, file_content, make_executable=True):
     """
     import stat
     
-    with open(file_path, 'w') as f:
+    #with open(file_path, 'w') as f:
+    with open_with_mkdir(file_path, 'w') as f:
         f.write(file_content)
     
     if make_executable:
