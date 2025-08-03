@@ -569,7 +569,7 @@ def replace_function_class(file_path, target_path, new_code):
     logging.debug(f"Modified {target_path} in {file_path}")
 
 def search_replace_text(file_path, search_text, replacement_text):
-    """Search for a line and replace it"""
+    """Search for some text and replace it"""
     with open(file_path, 'r') as f:
         lines = f.readlines()
     
