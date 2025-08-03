@@ -568,7 +568,7 @@ def replace_function_class(file_path, target_path, new_code):
     
     logging.debug(f"Modified {target_path} in {file_path}")
 
-def search_replace_line(file_path, search_text, replacement_text):
+def search_replace_text(file_path, search_text, replacement_text):
     """Search for a line and replace it"""
     with open(file_path, 'r') as f:
         lines = f.readlines()
@@ -587,8 +587,8 @@ def search_replace_line(file_path, search_text, replacement_text):
         f.writelines(lines)
     
     # Track file for git operations
-    if hasattr(search_replace_line, '_rollback_manager'):
-        search_replace_line._rollback_manager.track_file(file_path)
+    if hasattr(search_replace_text, '_rollback_manager'):
+        search_replace_text._rollback_manager.track_file(file_path)
     
     logging.debug(f"Replaced line containing '{search_text}' in {file_path}")
 
@@ -643,7 +643,7 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
     
     # Set rollback manager on modification functions
     replace_function_class._rollback_manager = rollback_manager
-    search_replace_line._rollback_manager = rollback_manager
+    search_replace_text._rollback_manager = rollback_manager
     move_file._rollback_manager = rollback_manager
     remove_file._rollback_manager = rollback_manager
     create_file._rollback_manager = rollback_manager
@@ -679,8 +679,8 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
         # Clean up rollback manager references
         if hasattr(replace_function_class, '_rollback_manager'):
             del replace_function_class._rollback_manager
-        if hasattr(search_replace_line, '_rollback_manager'):
-            del search_replace_line._rollback_manager
+        if hasattr(search_replace_text, '_rollback_manager'):
+            del search_replace_text._rollback_manager
         if hasattr(move_file, '_rollback_manager'):
             del move_file._rollback_manager
         if hasattr(remove_file, '_rollback_manager'):
