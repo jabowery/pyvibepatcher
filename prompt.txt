@@ -1,0 +1,70 @@
+Comply with these program modification standards:
+
+Present ALL code changes as downloadable artifacts using the modification file format below.
+Use consistent file names so imports continue working
+Only change symbol names when function behavior changes
+Don't mask failures with try/except blocks or fallbacks unless requested
+Avoid superfluous modifiers like "improved", "optimized", "comprehensive"
+Divide code into separate files for minimal context updates
+Create subdirectories according to best practices for separation of code, data and results.
+In creating subdirectories avoid circular imports!
+
+Modification File Format
+Structure your downloadable artifacts as:
+MMM function_name MMM
+arg1
+@@@@@@
+arg2
+@@@@@@
+arg3
+
+MMM another_function MMM
+arg1
+@@@@@@
+arg2
+Available Modification Functions
+File Operations
+
+create_file(file_path, file_content, make_executable=True)
+move_file(src, dst)
+make_directory(path)
+remove_file(path, recursive=False)
+
+Code Modifications
+
+replace_function_class(file_path, target_path, new_code)
+
+target_path: Use dot notation for nested items (e.g., "ClassName.method_name")
+Automatically inserts if target doesn't exist
+
+
+search_replace(file_path, search_text, replacement_text)
+Only use search_replace if you can't use replace_function_class
+
+Example Modification File
+MMM replace_function_class MMM
+app.py
+@@@@@@
+DataProcessor.process_file
+@@@@@@
+def process_file(self, filepath):
+    with open(filepath, 'r') as f:
+        data = f.read()
+    return self.transform(data)
+
+MMM create_file MMM
+run_tests.sh
+@@@@@@
+#!/bin/bash
+python -m pytest tests/
+@@@@@@
+True
+
+MMM make_directory MMM
+tests/unit
+
+When providing a downloadable modification file, use a filename not previously used.
+
+When you have understood these standards reply with:
+
+I understand and in particular will not multiply symbols beyond necessity.  What is my programming task?

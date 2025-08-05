@@ -568,29 +568,27 @@ def replace_function_class(file_path, target_path, new_code):
     
     logging.debug(f"Modified {target_path} in {file_path}")
 
-def search_replace_text(file_path, search_text, replacement_text):
-    """Search for some text and replace it"""
+def search_replace(file_path, search_text, replacement_text):
+    """Search for some text and replace it (supports multiline patterns)"""
     with open(file_path, 'r') as f:
-        lines = f.readlines()
+        content = f.read()
     
-    found = False
-    for i, line in enumerate(lines):
-        if search_text in line:
-            lines[i] = replacement_text + '\n' if not replacement_text.endswith('\n') else replacement_text
-            found = True
-            break
-    
-    if not found:
+    # Check if search_text exists in content
+    if search_text not in content:
         raise ValueError(f"Search text '{search_text}' not found in {file_path}")
     
+    # Perform the replacement
+    new_content = content.replace(search_text, replacement_text)
+    
+    # Write back to file
     with open(file_path, 'w') as f:
-        f.writelines(lines)
+        f.write(new_content)
     
     # Track file for git operations
-    if hasattr(search_replace_text, '_rollback_manager'):
-        search_replace_text._rollback_manager.track_file(file_path)
+    if hasattr(search_replace, '_rollback_manager'):
+        search_replace._rollback_manager.track_file(file_path)
     
-    logging.debug(f"Replaced line containing '{search_text}' in {file_path}")
+    logging.debug(f"Replaced text in {file_path}")
 
 def move_file(src, dst):
     """Move/rename file or directory"""
@@ -643,7 +641,7 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
     
     # Set rollback manager on modification functions
     replace_function_class._rollback_manager = rollback_manager
-    search_replace_text._rollback_manager = rollback_manager
+    search_replace._rollback_manager = rollback_manager
     move_file._rollback_manager = rollback_manager
     remove_file._rollback_manager = rollback_manager
     create_file._rollback_manager = rollback_manager
@@ -679,8 +677,8 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
         # Clean up rollback manager references
         if hasattr(replace_function_class, '_rollback_manager'):
             del replace_function_class._rollback_manager
-        if hasattr(search_replace_text, '_rollback_manager'):
-            del search_replace_text._rollback_manager
+        if hasattr(search_replace, '_rollback_manager'):
+            del search_replace._rollback_manager
         if hasattr(move_file, '_rollback_manager'):
             del move_file._rollback_manager
         if hasattr(remove_file, '_rollback_manager'):
