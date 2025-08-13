@@ -38,8 +38,8 @@ target_path: Use dot notation for nested items (e.g., "ClassName.method_name")
 Automatically inserts if target doesn't exist
 
 
-search_replace(file_path, search_text, replacement_text)
-Only use search_replace if you can't use replace_function_class
+search_replace(file_path, search_text, replacement_text) # Use as a last resort to replace_function_class
+
 
 Example Modification File
 MMM replace_function_class MMM

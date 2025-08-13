@@ -479,23 +479,62 @@ def replace_block(content: str,
     Replace a function or class in `content` with `new_code` using LibCST.
     - If `target_name`/`kind` are omitted, they are inferred from `new_code`.
     - lexical_chain specifies the containment hierarchy (e.g., ['ClassName'] for a method)
+    - Handles multiple statements in new_code by extracting the target def/class
     """
-    # Infer target_name/kind from new_code if not provided
+    # Parse new_code
     mod = cst.parse_module(new_code)
-    if len(mod.body) != 1:
-        breakpoint()
-        raise ValueError("new_code must contain exactly one top-level def/class.")
-    node = mod.body[0]
-    inferred_kind = "def" if isinstance(node, cst.FunctionDef) else "class" if isinstance(node, cst.ClassDef) else None
-    if inferred_kind is None:
-        raise ValueError("new_code must be a function or class definition.")
-    inferred_name = node.name.value
-
+    
+    # Handle different cases based on content of new_code
+    if len(mod.body) == 0:
+        raise ValueError("new_code cannot be empty.")
+    
+    elif len(mod.body) == 1:
+        # Original behavior - single statement
+        node = mod.body[0]
+        if not isinstance(node, (cst.FunctionDef, cst.ClassDef)):
+            raise ValueError("new_code must contain a function or class definition.")
+        replacement_node = node
+        inferred_kind = "def" if isinstance(node, cst.FunctionDef) else "class"
+        inferred_name = node.name.value
+    
+    else:
+        # Multiple statements - find the target def/class
+        replacement_node = None
+        inferred_kind = None
+        inferred_name = None
+        
+        # If target_name is provided, look for it specifically
+        if target_name:
+            for node in mod.body:
+                if isinstance(node, (cst.FunctionDef, cst.ClassDef)) and node.name.value == target_name:
+                    replacement_node = node
+                    inferred_kind = "def" if isinstance(node, cst.FunctionDef) else "class"
+                    inferred_name = node.name.value
+                    break
+        
+        # If not found or no target_name provided, use the first def/class
+        if replacement_node is None:
+            for node in mod.body:
+                if isinstance(node, (cst.FunctionDef, cst.ClassDef)):
+                    replacement_node = node
+                    inferred_kind = "def" if isinstance(node, cst.FunctionDef) else "class"
+                    inferred_name = node.name.value
+                    break
+        
+        if replacement_node is None:
+            raise ValueError("new_code must contain at least one function or class definition.")
+    
+    # Use provided parameters or infer from the found node
     kind = kind or inferred_kind
     target_name = target_name or inferred_name
-
+    
+    # Perform the replacement using only the replacement_node
     module = cst.parse_module(content)
-    new_module = module.visit(ReplaceDefOrClass(target_name, new_code, kind=kind, lexical_chain=lexical_chain))
+    
+    # Create a version of new_code with just the replacement node for the transformer
+    single_node_code = cst.Module(body=[replacement_node]).code
+    
+    new_module = module.visit(ReplaceDefOrClass(target_name, single_node_code, kind=kind, lexical_chain=lexical_chain))
     return new_module.code
 
 def insert_block(content: str,
@@ -748,6 +787,11 @@ def open_with_mkdir(filepath, mode='w', **kwargs):
     
     # Open and return the file object
     return open(filepath, mode=mode, **kwargs)
+
+def update_file(file_path, file_content):
+    if os.path.exists(file_path):
+        remove_file(file_path)
+    create_file(file_path, file_content)
 
 def create_file(file_path, file_content, make_executable=True):
     """Create a file
