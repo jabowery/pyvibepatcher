@@ -691,6 +691,7 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
     try:
         # Apply all modifications
         for func, args, kwargs in modifications:
+            print(func)
             func(*args, **kwargs)
         
         # Create final commit with tracked files
