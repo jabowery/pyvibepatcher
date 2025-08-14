@@ -78,17 +78,31 @@ class GitRollbackManager:
         self.rollback_data = {}
         self.tracked_files = set()
         self.accumulated_message = ""
-        def accumulate_message(self, message):
-            """Accumulate message text for commit message"""
-            if self.accumulated_message:
-                self.accumulated_message += "\n" + message
-            else:
-                self.accumulated_message = message
-        def get_accumulated_message(self):
-            """Get and clear accumulated message"""
-            message = self.accumulated_message
-            self.accumulated_message = ""
-            return message
+        self.accumulated_message = ""
+    def accumulate_message(self, message):
+        """Accumulate message text for commit message"""
+        if self.accumulated_message:
+            self.accumulated_message += "\n" + message
+        else:
+            self.accumulated_message = message
+    def get_accumulated_message(self):
+        """Get and clear accumulated message"""
+        message = self.accumulated_message
+        self.accumulated_message = ""
+        return message
+    def accumulate_message(self, message):
+        """Accumulate message text for commit message"""
+        if self.accumulated_message:
+            self.accumulated_message += "\n" + message
+        else:
+            self.accumulated_message = message
+
+    def get_accumulated_message(self):
+        """Get and clear accumulated message"""
+        message = self.accumulated_message
+        self.accumulated_message = ""
+        return message
+
     def has_staged_changes(self):
         """Check if there are staged changes ready to commit"""
         try:
@@ -758,6 +772,18 @@ def remove_file(path, recursive=False):
         logging.debug(f"Removed empty directory {path}")
     else:
         logging.info(f"Path {path} perhaps already removed.")
+
+def modification_description(description_text):
+    """
+    Add description text to the accumulated commit message
+    
+    Args:
+        description_text: Text to append to commit message
+    """
+    if hasattr(modification_description, '_rollback_manager'):
+        modification_description._rollback_manager.accumulate_message(description_text)
+    
+    logging.debug(f"Added modification description: {description_text}")
 
 def apply_modification_set(modifications, auto_rollback_on_failure=True):
     """
