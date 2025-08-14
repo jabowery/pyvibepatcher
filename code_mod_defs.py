@@ -651,15 +651,15 @@ def insert_block(content: str,
     return new_module.code
 
 
-def replace_declaration(file_path, target_path, new_code):
+def declare(file_path, target_path, new_code):
     """
-    Replace a function, class, or assignment in a file with new code using lexical chain support.
-    If the target doesn't exist, insert it in the appropriate location.
+    Declare a function, class, or assignment in a file with code using lexical chain support.
+    If the target_path exists one or more times, replace all with the new declaration.
     
     Args:
         file_path: Path to the Python file
         target_path: Target path like 'function_name', 'ClassName.method_name', or 'variable_name'
-        new_code: New function/class/assignment code to replace with
+        new_code: New function/class/assignment code defining the declaration's value.
     """
     logging.debug(f'file: {file_path}')
     with open(file_path, 'r') as f:
@@ -679,10 +679,10 @@ def replace_declaration(file_path, target_path, new_code):
         f.write(new_content)
     
     # Track file for git operations
-    if hasattr(replace_declaration, '_rollback_manager'):
-        replace_declaration._rollback_manager.track_file(file_path)
+    if hasattr(declare, '_rollback_manager'):
+        declare._rollback_manager.track_file(file_path)
     
-    logging.debug(f"Modified {target_path} in {file_path}")
+    logging.debug(f"Declared {target_path} in {file_path}")
 
 def search_replace(file_path, search_text, replacement_text):
     """Search for some text and replace it (supports multiline patterns)"""
@@ -756,8 +756,7 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
     rollback_manager = GitRollbackManager()
     
     # Set rollback manager on modification functions
-    replace_declaration._rollback_manager = rollback_manager
-    replace_declaration._rollback_manager = rollback_manager
+    declare._rollback_manager = rollback_manager
     search_replace._rollback_manager = rollback_manager
     move_file._rollback_manager = rollback_manager
     remove_file._rollback_manager = rollback_manager
@@ -793,10 +792,8 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
         raise
     finally:
         # Clean up rollback manager references
-        if hasattr(replace_declaration, '_rollback_manager'):
-            del replace_declaration._rollback_manager
-        if hasattr(replace_declaration, '_rollback_manager'):
-            del replace_declaration._rollback_manager
+        if hasattr(declare, '_rollback_manager'):
+            del declare._rollback_manager
         if hasattr(search_replace, '_rollback_manager'):
             del search_replace._rollback_manager
         if hasattr(move_file, '_rollback_manager'):

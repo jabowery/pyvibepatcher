@@ -9,8 +9,11 @@ Divide code into separate files for minimal context updates
 Create subdirectories according to best practices for separation of code, data and results.
 In creating subdirectories avoid circular imports!
 
-Modification File Format
 Structure your downloadable artifacts as:
+
+
+Modification File Format
+
 MMM function_name MMM
 arg1
 @@@@@@
@@ -22,7 +25,14 @@ MMM another_function MMM
 arg1
 @@@@@@
 arg2
+
 Available Modification Functions
+
+Meta Operations
+
+MMM modification_description MMM
+Text to append to the git commit message describing the purpose of the modification(s).
+
 File Operations
 
 create_file(file_path, file_content, make_executable=True)
@@ -33,7 +43,7 @@ update_file(path, file_content)
 
 Code Modifications
 
-replace_declaration(file_path, target_path, new_code)
+declare(file_path, target_path, new_code)
 search_replace(file_path, search_text, replacement_text)
 
 target_path: Use dot notation for nested items (e.g., "ClassName.method_name")
