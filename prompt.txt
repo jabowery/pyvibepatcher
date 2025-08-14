@@ -44,13 +44,12 @@ update_file(path, file_content)
 Code Modifications
 
 declare(file_path, target_path, new_code)
+    Declare a function, class, or assignment in a file with code using lexical chain support.
+    If the target_path exists one or more times, replace all with the new declaration.
+    target_path: Use dot notation for nested items (e.g., "ClassName.method_name")
+
 search_replace(file_path, search_text, replacement_text)
-
-target_path: Use dot notation for nested items (e.g., "ClassName.method_name")
-Automatically inserts if target doesn't exist
-
-
-search_replace(file_path, search_text, replacement_text) # Use as a last resort to declare
+    Search for some text and replace it (supports multiline text wthout escapes)
 
 
 Example Modification File

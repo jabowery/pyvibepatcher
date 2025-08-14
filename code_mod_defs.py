@@ -719,7 +719,7 @@ def declare(file_path, target_path, new_code):
     logging.debug(f"Declared {target_path} in {file_path}")
 
 def search_replace(file_path, search_text, replacement_text):
-    """Search for some text and replace it (supports multiline patterns)"""
+    """Search for some text and replace it (supports multiline text wthout escapes)"""
     with open(file_path, 'r') as f:
         content = f.read()
     
