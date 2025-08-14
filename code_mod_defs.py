@@ -406,30 +406,40 @@ def parse_lexical_chain(target_path: str) -> tuple[str, List[str]]:
     
     return parts[-1], parts[:-1]
 
-class ReplaceDefOrClass(cst.CSTTransformer):
+class ReplaceDeclaration(cst.CSTTransformer):
     def __init__(self, target_name: str, new_code: str,
                  kind: Optional[str] = None, lexical_chain: Optional[List[str]] = None):
         """
-        target_name: name of function or class to replace.
-        new_code: the full new def/class code (including decorators if any).
-        kind: "def" or "class" (if None, inferred from new_code).
+        target_name: name of function, class, or variable to replace.
+        new_code: the full new def/class/assignment code (including decorators if any).
+        kind: "def", "class", or "assign" (if None, inferred from new_code).
         lexical_chain: list of container names to traverse (e.g., ['ClassName'] for ClassName.method_name)
         """
         mod = cst.parse_module(new_code)
         if len(mod.body) != 1:
-            raise ValueError("new_code must contain exactly one top-level def/class.")
-        self.replacement = mod.body[0] #
+            raise ValueError("new_code must contain exactly one top-level def/class/assignment.")
+        self.replacement = mod.body[0]
+        
         if kind is None:
             if isinstance(self.replacement, cst.FunctionDef):
                 kind = "def"
             elif isinstance(self.replacement, cst.ClassDef):
                 kind = "class"
+            elif isinstance(self.replacement, cst.SimpleStatementLine):
+                # Check if it's an assignment
+                if (len(self.replacement.body) == 1 and 
+                    isinstance(self.replacement.body[0], cst.Assign)):
+                    kind = "assign"
+                else:
+                    raise ValueError("new_code must be a function, class, or assignment statement.")
             else:
-                raise ValueError("new_code must be a function or class definition.")
+                raise ValueError("new_code must be a function, class, or assignment statement.")
+        
         self.kind = kind
         self.target_name = target_name
         self.lexical_chain = lexical_chain or []
         self.context_stack: List[str] = []
+        self.found_count = 0
 
     def visit_ClassDef(self, node: cst.ClassDef) -> bool:
         self.context_stack.append(node.name.value)
@@ -446,6 +456,9 @@ class ReplaceDefOrClass(cst.CSTTransformer):
         if (self.kind == "class" 
             and original_node.name.value == self.target_name
             and self._matches_lexical_chain()):
+            self.found_count += 1
+            if self.found_count > 1:
+                raise ValueError(f"Multiple definitions found for {self.target_name}")
             return self.replacement.with_changes(leading_lines=original_node.leading_lines)
         return updated_node
 
@@ -456,7 +469,28 @@ class ReplaceDefOrClass(cst.CSTTransformer):
         if (self.kind == "def"
             and original_node.name.value == self.target_name
             and self._matches_lexical_chain()):
+            self.found_count += 1
+            if self.found_count > 1:
+                raise ValueError(f"Multiple definitions found for {self.target_name}")
             return self.replacement.with_changes(leading_lines=original_node.leading_lines)
+        return updated_node
+
+    def leave_SimpleStatementLine(self, original_node: cst.SimpleStatementLine, updated_node: cst.SimpleStatementLine) -> cst.BaseStatement:
+        # Handle assignment statements
+        if (self.kind == "assign" and len(updated_node.body) == 1 and 
+            isinstance(updated_node.body[0], cst.Assign)):
+            
+            assign_node = updated_node.body[0]
+            
+            # Check if any target matches our target_name
+            for target in assign_node.targets:
+                if isinstance(target.target, cst.Name) and target.target.value == self.target_name:
+                    if self._matches_lexical_chain():
+                        self.found_count += 1
+                        if self.found_count > 1:
+                            raise ValueError(f"Multiple definitions found for {self.target_name}")
+                        return self.replacement.with_changes(leading_lines=original_node.leading_lines)
+        
         return updated_node
 
     def _matches_lexical_chain(self) -> bool:
@@ -476,10 +510,10 @@ def replace_block(content: str,
                   kind: Optional[str] = None,
                   lexical_chain: Optional[List[str]] = None) -> str:
     """
-    Replace a function or class in `content` with `new_code` using LibCST.
+    Replace a function, class, or assignment in `content` with `new_code` using LibCST.
     - If `target_name`/`kind` are omitted, they are inferred from `new_code`.
     - lexical_chain specifies the containment hierarchy (e.g., ['ClassName'] for a method)
-    - Handles multiple statements in new_code by extracting the target def/class
+    - Handles multiple statements in new_code by extracting the target def/class/assignment
     """
     # Parse new_code
     mod = cst.parse_module(new_code)
@@ -491,16 +525,35 @@ def replace_block(content: str,
     elif len(mod.body) == 1:
         # Original behavior - single statement
         node = mod.body[0]
-        if not isinstance(node, (cst.FunctionDef, cst.ClassDef)):
+        
+        if isinstance(node, cst.FunctionDef):
+            replacement_node = node
+            inferred_kind = "def"
+            inferred_name = node.name.value
+        elif isinstance(node, cst.ClassDef):
+            replacement_node = node
+            inferred_kind = "class"
+            inferred_name = node.name.value
+        elif isinstance(node, cst.SimpleStatementLine):
+            # Check if it's an assignment
+            if (len(node.body) == 1 and isinstance(node.body[0], cst.Assign)):
+                assign_node = node.body[0]
+                if (len(assign_node.targets) == 1 and 
+                    isinstance(assign_node.targets[0].target, cst.Name)):
+                    replacement_node = node
+                    inferred_kind = "assign"
+                    inferred_name = assign_node.targets[0].target.value
+                else:
+                    raise ValueError("new_code must contain a simple assignment to a single variable.")
+            else:
+                raise ValueError("new_code must contain a function, class, or assignment definition.")
+        else:
             logging.debug(f"content: {content}")
             logging.debug(f"new_code: {new_code}")
-            raise ValueError("new_code must contain a function or class definition.")
-        replacement_node = node
-        inferred_kind = "def" if isinstance(node, cst.FunctionDef) else "class"
-        inferred_name = node.name.value
+            raise ValueError("new_code must contain a function, class, or assignment definition.")
     
     else:
-        # Multiple statements - find the target def/class
+        # Multiple statements - find the target def/class/assignment
         replacement_node = None
         inferred_kind = None
         inferred_name = None
@@ -508,13 +561,25 @@ def replace_block(content: str,
         # If target_name is provided, look for it specifically
         if target_name:
             for node in mod.body:
-                if isinstance(node, (cst.FunctionDef, cst.ClassDef)) and node.name.value == target_name:
-                    replacement_node = node
-                    inferred_kind = "def" if isinstance(node, cst.FunctionDef) else "class"
-                    inferred_name = node.name.value
-                    break
+                if isinstance(node, (cst.FunctionDef, cst.ClassDef)):
+                    if node.name.value == target_name:
+                        replacement_node = node
+                        inferred_kind = "def" if isinstance(node, cst.FunctionDef) else "class"
+                        inferred_name = node.name.value
+                        break
+                elif isinstance(node, cst.SimpleStatementLine):
+                    if (len(node.body) == 1 and isinstance(node.body[0], cst.Assign)):
+                        assign_node = node.body[0]
+                        for target in assign_node.targets:
+                            if isinstance(target.target, cst.Name) and target.target.value == target_name:
+                                replacement_node = node
+                                inferred_kind = "assign"
+                                inferred_name = target_name
+                                break
+                        if replacement_node:
+                            break
         
-        # If not found or no target_name provided, use the first def/class
+        # If not found or no target_name provided, use the first def/class/assignment
         if replacement_node is None:
             for node in mod.body:
                 if isinstance(node, (cst.FunctionDef, cst.ClassDef)):
@@ -522,9 +587,18 @@ def replace_block(content: str,
                     inferred_kind = "def" if isinstance(node, cst.FunctionDef) else "class"
                     inferred_name = node.name.value
                     break
+                elif isinstance(node, cst.SimpleStatementLine):
+                    if (len(node.body) == 1 and isinstance(node.body[0], cst.Assign)):
+                        assign_node = node.body[0]
+                        if (len(assign_node.targets) == 1 and 
+                            isinstance(assign_node.targets[0].target, cst.Name)):
+                            replacement_node = node
+                            inferred_kind = "assign"
+                            inferred_name = assign_node.targets[0].target.value
+                            break
         
         if replacement_node is None:
-            raise ValueError("new_code must contain at least one function or class definition.")
+            raise ValueError("new_code must contain at least one function, class, or assignment definition.")
     
     # Use provided parameters or infer from the found node
     kind = kind or inferred_kind
@@ -536,7 +610,7 @@ def replace_block(content: str,
     # Create a version of new_code with just the replacement node for the transformer
     single_node_code = cst.Module(body=[replacement_node]).code
     
-    new_module = module.visit(ReplaceDefOrClass(target_name, single_node_code, kind=kind, lexical_chain=lexical_chain))
+    new_module = module.visit(ReplaceDeclaration(target_name, single_node_code, kind=kind, lexical_chain=lexical_chain))
     return new_module.code
 
 def insert_block(content: str,
@@ -577,15 +651,15 @@ def insert_block(content: str,
     return new_module.code
 
 
-def replace_function_class(file_path, target_path, new_code):
+def replace_declaration(file_path, target_path, new_code):
     """
-    Replace a function or class in a file with new code using lexical chain support.
+    Replace a function, class, or assignment in a file with new code using lexical chain support.
     If the target doesn't exist, insert it in the appropriate location.
     
     Args:
         file_path: Path to the Python file
-        target_path: Target path like 'function_name' or 'ClassName.method_name'
-        new_code: New function/class code to replace with
+        target_path: Target path like 'function_name', 'ClassName.method_name', or 'variable_name'
+        new_code: New function/class/assignment code to replace with
     """
     logging.debug(f'file: {file_path}')
     with open(file_path, 'r') as f:
@@ -605,8 +679,8 @@ def replace_function_class(file_path, target_path, new_code):
         f.write(new_content)
     
     # Track file for git operations
-    if hasattr(replace_function_class, '_rollback_manager'):
-        replace_function_class._rollback_manager.track_file(file_path)
+    if hasattr(replace_declaration, '_rollback_manager'):
+        replace_declaration._rollback_manager.track_file(file_path)
     
     logging.debug(f"Modified {target_path} in {file_path}")
 
@@ -682,6 +756,7 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
     rollback_manager = GitRollbackManager()
     
     # Set rollback manager on modification functions
+    replace_declaration._rollback_manager = rollback_manager
     replace_function_class._rollback_manager = rollback_manager
     search_replace._rollback_manager = rollback_manager
     move_file._rollback_manager = rollback_manager
@@ -718,6 +793,8 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
         raise
     finally:
         # Clean up rollback manager references
+        if hasattr(replace_declaration, '_rollback_manager'):
+            del replace_declaration._rollback_manager
         if hasattr(replace_function_class, '_rollback_manager'):
             del replace_function_class._rollback_manager
         if hasattr(search_replace, '_rollback_manager'):
