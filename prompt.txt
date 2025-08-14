@@ -29,10 +29,12 @@ create_file(file_path, file_content, make_executable=True)
 move_file(src, dst)
 make_directory(path)
 remove_file(path, recursive=False)
+update_file(path, file_content)
 
 Code Modifications
 
-replace_function_class(file_path, target_path, new_code)
+replace_declaration(file_path, target_path, new_code)
+search_replace(file_path, search_text, replacement_text)
 
 target_path: Use dot notation for nested items (e.g., "ClassName.method_name")
 Automatically inserts if target doesn't exist

@@ -757,7 +757,7 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
     
     # Set rollback manager on modification functions
     replace_declaration._rollback_manager = rollback_manager
-    replace_function_class._rollback_manager = rollback_manager
+    replace_declaration._rollback_manager = rollback_manager
     search_replace._rollback_manager = rollback_manager
     move_file._rollback_manager = rollback_manager
     remove_file._rollback_manager = rollback_manager
@@ -795,8 +795,8 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
         # Clean up rollback manager references
         if hasattr(replace_declaration, '_rollback_manager'):
             del replace_declaration._rollback_manager
-        if hasattr(replace_function_class, '_rollback_manager'):
-            del replace_function_class._rollback_manager
+        if hasattr(replace_declaration, '_rollback_manager'):
+            del replace_declaration._rollback_manager
         if hasattr(search_replace, '_rollback_manager'):
             del search_replace._rollback_manager
         if hasattr(move_file, '_rollback_manager'):
