@@ -458,7 +458,7 @@ class ReplaceDeclaration(cst.CSTTransformer):
             and self._matches_lexical_chain()):
             self.found_count += 1
             if self.found_count > 1:
-                raise ValueError(f"Multiple definitions found for {self.target_name}")
+                logging.warning(f"Multiple definitions found for {self.target_name}, replacing all instances")
             return self.replacement.with_changes(leading_lines=original_node.leading_lines)
         return updated_node
 
@@ -471,7 +471,7 @@ class ReplaceDeclaration(cst.CSTTransformer):
             and self._matches_lexical_chain()):
             self.found_count += 1
             if self.found_count > 1:
-                raise ValueError(f"Multiple definitions found for {self.target_name}")
+                logging.warning(f"Multiple definitions found for {self.target_name}, replacing all instances")
             return self.replacement.with_changes(leading_lines=original_node.leading_lines)
         return updated_node
 
@@ -488,7 +488,7 @@ class ReplaceDeclaration(cst.CSTTransformer):
                     if self._matches_lexical_chain():
                         self.found_count += 1
                         if self.found_count > 1:
-                            raise ValueError(f"Multiple definitions found for {self.target_name}")
+                            logging.warning(f"Multiple definitions found for {self.target_name}, replacing all instances")
                         return self.replacement.with_changes(leading_lines=original_node.leading_lines)
         
         return updated_node
