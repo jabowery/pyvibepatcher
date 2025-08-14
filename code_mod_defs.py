@@ -492,6 +492,8 @@ def replace_block(content: str,
         # Original behavior - single statement
         node = mod.body[0]
         if not isinstance(node, (cst.FunctionDef, cst.ClassDef)):
+            logging.debug(f"content: {content}")
+            logging.debug(f"new_code: {new_code}")
             raise ValueError("new_code must contain a function or class definition.")
         replacement_node = node
         inferred_kind = "def" if isinstance(node, cst.FunctionDef) else "class"
@@ -585,6 +587,7 @@ def replace_function_class(file_path, target_path, new_code):
         target_path: Target path like 'function_name' or 'ClassName.method_name'
         new_code: New function/class code to replace with
     """
+    logging.debug(f'file: {file_path}')
     with open(file_path, 'r') as f:
         content = f.read()
     
@@ -660,7 +663,7 @@ def remove_file(path, recursive=False):
         os.rmdir(path)
         logging.debug(f"Removed empty directory {path}")
     else:
-        raise FileNotFoundError(f"Path {path} does not exist")
+        logging.info(f"Path {path} perhaps already removed.")
 
 def apply_modification_set(modifications, auto_rollback_on_failure=True):
     """
