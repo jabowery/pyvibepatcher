@@ -77,6 +77,18 @@ class GitRollbackManager:
         self.rollback_file = rollback_file
         self.rollback_data = {}
         self.tracked_files = set()
+        self.accumulated_message = ""
+        def accumulate_message(self, message):
+            """Accumulate message text for commit message"""
+            if self.accumulated_message:
+                self.accumulated_message += "\n" + message
+            else:
+                self.accumulated_message = message
+        def get_accumulated_message(self):
+            """Get and clear accumulated message"""
+            message = self.accumulated_message
+            self.accumulated_message = ""
+            return message
     def has_staged_changes(self):
         """Check if there are staged changes ready to commit"""
         try:
@@ -410,11 +422,11 @@ class ReplaceDeclaration(cst.CSTTransformer):
     def __init__(self, target_name: str, new_code: str,
                  kind: Optional[str] = None, lexical_chain: Optional[List[str]] = None):
         """
-        target_name: name of function, class, or variable to replace.
-        new_code: the full new def/class/assignment code (including decorators if any).
-        kind: "def", "class", or "assign" (if None, inferred from new_code).
-        lexical_chain: list of container names to traverse (e.g., ['ClassName'] for ClassName.method_name)
-        """
+    target_name: name of function, class, or variable to replace.
+    new_code: the full new def/class/assignment code (including decorators if any).
+    kind: "def", "class", or "assign" (if None, inferred from new_code).
+    lexical_chain: list of container names to traverse (e.g., ['ClassName'] for ClassName.method_name)
+    """
         mod = cst.parse_module(new_code)
         if len(mod.body) != 1:
             raise ValueError("new_code must contain exactly one top-level def/class/assignment.")
@@ -440,6 +452,7 @@ class ReplaceDeclaration(cst.CSTTransformer):
         self.lexical_chain = lexical_chain or []
         self.context_stack: List[str] = []
         self.found_count = 0
+        self.replaced = False
 
     def visit_ClassDef(self, node: cst.ClassDef) -> bool:
         self.context_stack.append(node.name.value)
@@ -457,6 +470,7 @@ class ReplaceDeclaration(cst.CSTTransformer):
             and original_node.name.value == self.target_name
             and self._matches_lexical_chain()):
             self.found_count += 1
+            self.replaced = True
             if self.found_count > 1:
                 logging.warning(f"Multiple definitions found for {self.target_name}, replacing all instances")
             return self.replacement.with_changes(leading_lines=original_node.leading_lines)
@@ -470,6 +484,7 @@ class ReplaceDeclaration(cst.CSTTransformer):
             and original_node.name.value == self.target_name
             and self._matches_lexical_chain()):
             self.found_count += 1
+            self.replaced = True
             if self.found_count > 1:
                 logging.warning(f"Multiple definitions found for {self.target_name}, replacing all instances")
             return self.replacement.with_changes(leading_lines=original_node.leading_lines)
@@ -487,6 +502,7 @@ class ReplaceDeclaration(cst.CSTTransformer):
                 if isinstance(target.target, cst.Name) and target.target.value == self.target_name:
                     if self._matches_lexical_chain():
                         self.found_count += 1
+                        self.replaced = True
                         if self.found_count > 1:
                             logging.warning(f"Multiple definitions found for {self.target_name}, replacing all instances")
                         return self.replacement.with_changes(leading_lines=original_node.leading_lines)
@@ -508,12 +524,15 @@ def replace_block(content: str,
                   new_code: str,
                   target_name: Optional[str] = None,
                   kind: Optional[str] = None,
-                  lexical_chain: Optional[List[str]] = None) -> str:
+                  lexical_chain: Optional[List[str]] = None) -> tuple[str, bool]:
     """
     Replace a function, class, or assignment in `content` with `new_code` using LibCST.
     - If `target_name`/`kind` are omitted, they are inferred from `new_code`.
     - lexical_chain specifies the containment hierarchy (e.g., ['ClassName'] for a method)
     - Handles multiple statements in new_code by extracting the target def/class/assignment
+    
+    Returns:
+        tuple: (modified_content, was_replaced)
     """
     # Parse new_code
     mod = cst.parse_module(new_code)
@@ -610,8 +629,10 @@ def replace_block(content: str,
     # Create a version of new_code with just the replacement node for the transformer
     single_node_code = cst.Module(body=[replacement_node]).code
     
-    new_module = module.visit(ReplaceDeclaration(target_name, single_node_code, kind=kind, lexical_chain=lexical_chain))
-    return new_module.code
+    transformer = ReplaceDeclaration(target_name, single_node_code, kind=kind, lexical_chain=lexical_chain)
+    new_module = module.visit(transformer)
+    
+    return new_module.code, transformer.replaced
 
 def insert_block(content: str,
                  new_code: str,
@@ -668,11 +689,10 @@ def declare(file_path, target_path, new_code):
     target_name, lexical_chain = parse_lexical_chain(target_path)
     
     # Try replacement first
-    new_content = replace_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+    new_content, was_replaced = replace_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
     
-    # Check if replacement actually happened by comparing content
-    if new_content == content:
-        # Target not found, insert instead
+    # If replacement didn't happen, insert instead
+    if not was_replaced:
         new_content = insert_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
 
     with open(file_path, 'w') as f:
@@ -761,19 +781,38 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
     move_file._rollback_manager = rollback_manager
     remove_file._rollback_manager = rollback_manager
     create_file._rollback_manager = rollback_manager
+    modification_description._rollback_manager = rollback_manager
     
     # Create rollback point - this will raise if it fails
     rollback_info = rollback_manager.create_rollback_point("Before LLM modifications")
     
+    # Process modifications and build commit message
+    accumulated_descriptions = []
+    other_modifications = []
+    
+    for func, args, kwargs in modifications:
+        if func == modification_description:
+            accumulated_descriptions.append(args[0])
+        else:
+            other_modifications.append((func, args, kwargs))
+    
+    # Set accumulated message from all descriptions
+    if accumulated_descriptions:
+        full_description = "\n".join(accumulated_descriptions)
+        rollback_manager.accumulate_message(full_description)
+    
     try:
-        # Apply all modifications
-        for func, args, kwargs in modifications:
+        # Apply all non-description modifications
+        for func, args, kwargs in other_modifications:
             print(func)
             func(*args, **kwargs)
         
-        # Create final commit with tracked files
+        # Create final commit with tracked files and accumulated message
         if rollback_manager.tracked_files:
-            rollback_manager.create_rollback_point("After LLM modifications", force_commit=True)
+            commit_message = rollback_manager.get_accumulated_message()
+            if not commit_message:
+                commit_message = "After LLM modifications"
+            rollback_manager.create_rollback_point(commit_message, force_commit=True)
         
         logging.info("All modifications completed successfully")
         rollback_manager.show_rollback_options()
@@ -802,6 +841,8 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
             del remove_file._rollback_manager
         if hasattr(create_file, '_rollback_manager'):
             del create_file._rollback_manager
+        if hasattr(modification_description, '_rollback_manager'):
+            del modification_description._rollback_manager
 
 # Interactive rollback interface
 def interactive_rollback():
@@ -902,3 +943,14 @@ if __name__ == "__main__":
     
     if len(sys.argv) > 1 and sys.argv[1] == 'rollback':
         interactive_rollback()
+def modification_description(description_text):
+    """
+    Add description text to the accumulated commit message
+    
+    Args:
+        description_text: Text to append to commit message
+    """
+    if hasattr(modification_description, '_rollback_manager'):
+        modification_description._rollback_manager.accumulate_message(description_text)
+    
+    logging.debug(f"Added modification description: {description_text}")
