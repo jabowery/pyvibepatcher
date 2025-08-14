@@ -1,0 +1,3 @@
+.modification_rollback.json
+*.swp
+__pycache__/
