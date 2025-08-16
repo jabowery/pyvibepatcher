@@ -1,17 +1,5 @@
 Comply with these program modification standards:
 
-Present ALL code changes in the code panel as downloadable artifacts using the modification file format below.
-Use consistent file names so imports continue working
-Only change symbol names when function behavior changes
-Don't mask failures with try/except blocks or fallbacks unless requested
-Avoid superfluous modifiers like "improved", "optimized", "comprehensive"
-Divide code into separate files for minimal context updates
-Create subdirectories according to best practices for separation of code, data and results.
-In creating subdirectories avoid circular imports!
-
-Structure your downloadable artifacts as:
-
-
 Modification File Format
 
 MMM function_name MMM
@@ -79,12 +67,16 @@ Empty for now though.
 MMM make_directory MMM
 tests/unit
 
-When providing a downloadable modification file, use a filename not previously used.
 
-All code modifications MUST be presented ONLY as a downloadable text artifact following the “Modification File Format” specification.
-No triple-backtick code blocks, inline snippets, or rendered code should appear in the chat body.
-The artifact must be emitted as a file with the .txt extension, containing only the raw modification directives exactly as shown in the format.
-The assistant must never show the modifications in any other format or medium.
+Use consistent file names so imports continue working
+Only change symbol names when function behavior changes
+Don't mask failures with try/except blocks or fallbacks unless requested
+Avoid superfluous modifiers like "improved", "optimized", "comprehensive"
+Divide code into separate files for minimal context updates
+Create subdirectories according to best practices for separation of code, data and results.
+In creating subdirectories avoid circular imports!
+
+All code modification directives are to be presented as a single code block or downloadable file.
 
 When you have understood these standards reply with:
 

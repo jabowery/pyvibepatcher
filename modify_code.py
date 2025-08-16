@@ -16,7 +16,6 @@ def parse_modification_file(file_path):
     
     # Split by function markers
     function_blocks = re.split(r'MMM\s+(\w+)\s+MMM', content)[1:]  # Skip empty first element
-    
     # Process pairs: function_name, content
     for i in range(0, len(function_blocks), 2):
         if i + 1 >= len(function_blocks):
@@ -26,7 +25,8 @@ def parse_modification_file(file_path):
         block_content = function_blocks[i + 1].strip()
         
         # Split arguments by @@@@@@
-        args = re.split(r'@{6}|@{3}\s@{3}', block_content)
+        #args = re.split(r'@{6}|@{3}\s@{3}', block_content)
+        args = re.split(r'@{6}', block_content)
         args = [arg.strip() for arg in args if arg.strip()]
         
         # Get function from globals
