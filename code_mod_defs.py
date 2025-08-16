@@ -808,6 +808,13 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
     remove_file._rollback_manager = rollback_manager
     create_file._rollback_manager = rollback_manager
     modification_description._rollback_manager = rollback_manager
+    # Register the newly added helpers:
+    if 'replace_regex' in globals():
+        globals()['replace_regex']._rollback_manager = rollback_manager
+    if 'insert_after_regex' in globals():
+        globals()['insert_after_regex']._rollback_manager = rollback_manager
+    if 'ensure_line_in_file' in globals():
+        globals()['ensure_line_in_file']._rollback_manager = rollback_manager
     
     # Create rollback point - this will raise if it fails
     rollback_info = rollback_manager.create_rollback_point("Before LLM modifications")
@@ -869,6 +876,12 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
             del create_file._rollback_manager
         if hasattr(modification_description, '_rollback_manager'):
             del modification_description._rollback_manager
+        if 'replace_regex' in globals() and hasattr(globals()['replace_regex'], '_rollback_manager'):
+            del globals()['replace_regex']._rollback_manager
+        if 'insert_after_regex' in globals() and hasattr(globals()['insert_after_regex'], '_rollback_manager'):
+            del globals()['insert_after_regex']._rollback_manager
+        if 'ensure_line_in_file' in globals() and hasattr(globals()['ensure_line_in_file'], '_rollback_manager'):
+            del globals()['ensure_line_in_file']._rollback_manager
 
 # Interactive rollback interface
 def interactive_rollback():
@@ -933,10 +946,10 @@ def open_with_mkdir(filepath, mode='w', **kwargs):
     # Open and return the file object
     return open(filepath, mode=mode, **kwargs)
 
-def update_file(file_path, file_content):
+def update_file(file_path, file_content, make_executable=False):
     if os.path.exists(file_path):
         remove_file(file_path)
-    create_file(file_path, file_content)
+    create_file(file_path, file_content, make_executable=make_executable)
 
 def create_file(file_path, file_content, make_executable=True):
     """Create a file
@@ -980,3 +993,103 @@ def modification_description(description_text):
         modification_description._rollback_manager.accumulate_message(description_text)
     
     logging.debug(f"Added modification description: {description_text}")
+def replace_regex(file_path, pattern, replacement, flags=None):
+    """
+    Regex-based find/replace using Python's re.sub with DOTALL by default.
+
+    Args:
+        file_path (str): Path to file to modify.
+        pattern (str): Python regex pattern.
+        replacement (str): Replacement text (can contain backrefs).
+        flags (int|None): Optional re flags; defaults to re.DOTALL.
+
+    Raises:
+        ValueError: If pattern is not found (causes no textual change).
+    """
+    import re
+    if flags is None:
+        flags = re.DOTALL
+
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    new_content, count = re.subn(pattern, replacement, content, flags=flags)
+
+    if count == 0:
+        raise ValueError(f"Pattern not found or no changes made in {file_path}")
+
+    with open(file_path, 'w', encoding='utf-8') as f:
+        f.write(new_content)
+
+    # Track file for git operations
+    if hasattr(replace_regex, '_rollback_manager'):
+        replace_regex._rollback_manager.track_file(file_path)
+def insert_after_regex(file_path, pattern, text_to_insert, flags=None):
+    """
+    Insert text immediately after the first regex match.
+
+    Args:
+        file_path (str): Path to file to modify.
+        pattern (str): Python regex pattern.
+        text_to_insert (str): Text to insert after the match.
+        flags (int|None): Optional re flags; defaults to re.DOTALL|re.MULTILINE.
+
+    Raises:
+        ValueError: If pattern is not found.
+    """
+    import re
+    if flags is None:
+        flags = re.DOTALL | re.MULTILINE
+
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    m = re.search(pattern, content, flags)
+    if not m:
+        raise ValueError(f"Pattern not found in {file_path}")
+
+    insert_pos = m.end()
+    new_content = content[:insert_pos] + text_to_insert + content[insert_pos:]
+
+    with open(file_path, 'w', encoding='utf-8') as f:
+        f.write(new_content)
+
+    # Track file for git operations
+    if hasattr(insert_after_regex, '_rollback_manager'):
+        insert_after_regex._rollback_manager.track_file(file_path)
+def ensure_line_in_file(file_path, line):
+    """
+    Ensure an exact line exists in a file; append it if missing.
+
+    Args:
+        file_path (str): Path to file to modify.
+        line (str): Exact line content (without trailing newline).
+
+    Notes:
+        - Adds a trailing newline if the file does not already end in one.
+        - No-op if the exact line already exists.
+    """
+    # Read file contents
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except FileNotFoundError:
+        content = ""
+
+    lines = content.splitlines()
+    if line in lines:
+        # Already present; still track for determinism
+        if hasattr(ensure_line_in_file, '_rollback_manager'):
+            ensure_line_in_file._rollback_manager.track_file(file_path)
+        return
+
+    if content and not content.endswith('\n'):
+        content += '\n'
+    content += line + '\n'
+
+    with open(file_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+    # Track file for git operations
+    if hasattr(ensure_line_in_file, '_rollback_manager'):
+        ensure_line_in_file._rollback_manager.track_file(file_path)
