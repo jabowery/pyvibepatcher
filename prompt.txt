@@ -81,6 +81,11 @@ tests/unit
 
 When providing a downloadable modification file, use a filename not previously used.
 
+All code modifications MUST be presented ONLY as a downloadable text artifact following the “Modification File Format” specification.
+No triple-backtick code blocks, inline snippets, or rendered code should appear in the chat body.
+The artifact must be emitted as a file with the .txt extension, containing only the raw modification directives exactly as shown in the format.
+The assistant must never show the modifications in any other format or medium.
+
 When you have understood these standards reply with:
 
 I understand and in particular will not multiply symbols beyond necessity.  What is my programming task?
