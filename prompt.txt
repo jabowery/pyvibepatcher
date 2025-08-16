@@ -1,6 +1,6 @@
 Comply with these program modification standards:
 
-Present ALL code changes as downloadable artifacts using the modification file format below.
+Present ALL code changes in the code panel as downloadable artifacts using the modification file format below.
 Use consistent file names so imports continue working
 Only change symbol names when function behavior changes
 Don't mask failures with try/except blocks or fallbacks unless requested
@@ -53,6 +53,9 @@ search_replace(file_path, search_text, replacement_text)
 
 
 Example Modification File
+MMM modification_description MMM
+Fix file processing.
+(with was absent and potentially problematic under failures.)
 MMM declare MMM
 app.py
 @@@@@@
@@ -70,7 +73,9 @@ run_tests.sh
 python -m pytest tests/
 @@@@@@
 True
-
+MMM modification_descrption MMM
+Stub out unit directory for future unit tests.
+Empty for now though.
 MMM make_directory MMM
 tests/unit
 
