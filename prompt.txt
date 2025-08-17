@@ -36,11 +36,8 @@ declare(file_path, target_path, new_code)
     If the target_path exists one or more times, replace all with the new declaration.
     target_path: Use dot notation for nested items (e.g., "ClassName.method_name")
 
-search_replace(file_path, search_text, replacement_text)
-    Search for some text and replace it (supports multiline text wthout escapes)
-
-
 Example Modification File
+
 MMM modification_description MMM
 Fix file processing.
 (with was absent and potentially problematic under failures.)
@@ -67,7 +64,7 @@ Empty for now though.
 MMM make_directory MMM
 tests/unit
 
-
+If something needs to be changed at the __main__ level other than a declaration, update the entire file.
 Use consistent file names so imports continue working
 Only change symbol names when function behavior changes
 Don't mask failures with try/except blocks or fallbacks unless requested
