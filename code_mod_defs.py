@@ -32,38 +32,6 @@ class InsertIntoContainer(cst.CSTTransformer):
         self.context_stack.append(node.name.value)
         return True
 
-    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.BaseStatement:
-        # Insert into this class if it matches our target chain
-        if (not self.inserted and 
-            self._matches_insertion_point() and
-            isinstance(self.node_to_insert, cst.FunctionDef)):
-            
-            # Insert the method at the end of the class body
-            new_body = list(updated_node.body.body) + [self.node_to_insert]
-            updated_node = updated_node.with_changes(
-                body=updated_node.body.with_changes(body=new_body)
-            )
-            self.inserted = True
-        
-        self.context_stack.pop()
-        return updated_node
-
-    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.BaseStatement:
-        # Insert into this function if it matches our target chain
-        if (not self.inserted and 
-            self._matches_insertion_point() and
-            isinstance(self.node_to_insert, cst.FunctionDef)):
-            
-            # Insert the nested function at the end of the function body
-            new_body = list(updated_node.body.body) + [self.node_to_insert]
-            updated_node = updated_node.with_changes(
-                body=updated_node.body.with_changes(body=new_body)
-            )
-            self.inserted = True
-            
-        self.context_stack.pop()
-        return updated_node
-
     def _matches_insertion_point(self) -> bool:
         """Check if current context matches where we want to insert"""
         return self.context_stack == self.lexical_chain
@@ -155,7 +123,7 @@ class GitRollbackManager:
                     # File was deleted, add it for removal
                     result = subprocess.run(['git', 'add', file_path], capture_output=True)
                     if result.returncode != 0:
-                        raise RuntimeError(f"Failed to stage deleted file {file_path}: {result.stderr.decode()}")
+                        logging.warning(f"Failed to stage deleted file {file_path}: {result.stderr.decode()}")
         
         # Check if there are staged changes to commit
         has_staged = self.has_staged_changes()
@@ -475,32 +443,35 @@ class ReplaceDeclaration(cst.CSTTransformer):
         return True
 
     def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.BaseStatement:
-        current_name = self.context_stack.pop()
-        
-        # Replace class definition if it matches
-        if (self.kind == "class" 
-            and original_node.name.value == self.target_name
-            and self._matches_lexical_chain()):
-            self.found_count += 1
-            self.replaced = True
-            if self.found_count > 1:
-                logging.warning(f"Multiple definitions found for {self.target_name}, replacing all instances")
-            return self.replacement.with_changes(leading_lines=original_node.leading_lines)
-        return updated_node
+        # Replace class definition if it matches (compare against containers, excluding this class)
+        try:
+            if (self.kind == "class"
+                and original_node.name.value == self.target_name
+                and self._matches_containers(exclude_current=True)):
+                self.found_count += 1
+                self.replaced = True
+                if self.found_count > 1:
+                    logging.warning(f"Multiple definitions found for {self.target_name}, replacing all instances")
+                return self.replacement.with_changes(leading_lines=original_node.leading_lines)
+            return updated_node
+        finally:
+            self.context_stack.pop()
 
     def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.BaseStatement:
-        current_name = self.context_stack.pop()
-        
-        # Replace function definition if it matches
-        if (self.kind == "def"
-            and original_node.name.value == self.target_name
-            and self._matches_lexical_chain()):
-            self.found_count += 1
-            self.replaced = True
-            if self.found_count > 1:
-                logging.warning(f"Multiple definitions found for {self.target_name}, replacing all instances")
-            return self.replacement.with_changes(leading_lines=original_node.leading_lines)
-        return updated_node
+        # Replace function/method if it matches (compare against containers, excluding this function)
+        try:
+            if (self.kind == "def"
+                and original_node.name.value == self.target_name
+                and self._matches_containers(exclude_current=True)):
+                self.found_count += 1
+                self.replaced = True
+                if self.found_count > 1:
+                    logging.warning(f"Multiple definitions found for {self.target_name}, replacing all instances")
+                return self.replacement.with_changes(leading_lines=original_node.leading_lines)
+            return updated_node
+        finally:
+            self.context_stack.pop()
+
 
     def leave_SimpleStatementLine(self, original_node: cst.SimpleStatementLine, updated_node: cst.SimpleStatementLine) -> cst.BaseStatement:
         # Handle assignment statements
@@ -520,17 +491,16 @@ class ReplaceDeclaration(cst.CSTTransformer):
                         return self.replacement.with_changes(leading_lines=original_node.leading_lines)
         
         return updated_node
-
-    def _matches_lexical_chain(self) -> bool:
-        """Check if current context matches the required lexical chain"""
+    
+    def _matches_containers(self, exclude_current: bool = False) -> bool:
+        """Compare lexical_chain against the container context (optionally excluding the current node)."""
+        stack = self.context_stack[:-1] if exclude_current else self.context_stack
         if not self.lexical_chain:
             return True
-        
-        if len(self.context_stack) < len(self.lexical_chain):
+        if len(stack) < len(self.lexical_chain):
             return False
-        
-        # Check if the chain matches from the end
-        return self.context_stack[-len(self.lexical_chain):] == self.lexical_chain
+        return stack[-len(self.lexical_chain):] == self.lexical_chain
+
 
 def replace_block(content: str,
                   new_code: str,
@@ -715,27 +685,6 @@ def declare(file_path, target_path, new_code):
     
     logging.debug(f"Declared {target_path} in {file_path}")
 
-def search_replace(file_path, search_text, replacement_text=''):
-    """Search for some text and replace it (supports multiline text wthout escapes)"""
-    with open(file_path, 'r') as f:
-        content = f.read()
-    # Check if search_text exists in content
-    if search_text not in content:
-        raise ValueError(f"Search text '{search_text}' not found in {file_path}")
-    
-    # Perform the replacement
-    new_content = content.replace(search_text, replacement_text)
-    
-    # Write back to file
-    with open(file_path, 'w') as f:
-        f.write(new_content)
-    
-    # Track file for git operations
-    if hasattr(search_replace, '_rollback_manager'):
-        search_replace._rollback_manager.track_file(file_path)
-    
-    logging.debug(f"Replaced text in {file_path}")
-
 def move_file(src, dst):
     """Move/rename file or directory"""
     # Track both source and destination for git operations
@@ -799,18 +748,11 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
     
     # Set rollback manager on modification functions
     declare._rollback_manager = rollback_manager
-    search_replace._rollback_manager = rollback_manager
     move_file._rollback_manager = rollback_manager
     remove_file._rollback_manager = rollback_manager
     create_file._rollback_manager = rollback_manager
     modification_description._rollback_manager = rollback_manager
     # Register the newly added helpers:
-    if 'replace_regex' in globals():
-        globals()['replace_regex']._rollback_manager = rollback_manager
-    if 'insert_after_regex' in globals():
-        globals()['insert_after_regex']._rollback_manager = rollback_manager
-    if 'ensure_line_in_file' in globals():
-        globals()['ensure_line_in_file']._rollback_manager = rollback_manager
     
     # Create rollback point - this will raise if it fails
     rollback_info = rollback_manager.create_rollback_point("Before LLM modifications")
@@ -862,8 +804,6 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
         # Clean up rollback manager references
         if hasattr(declare, '_rollback_manager'):
             del declare._rollback_manager
-        if hasattr(search_replace, '_rollback_manager'):
-            del search_replace._rollback_manager
         if hasattr(move_file, '_rollback_manager'):
             del move_file._rollback_manager
         if hasattr(remove_file, '_rollback_manager'):
@@ -872,12 +812,6 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
             del create_file._rollback_manager
         if hasattr(modification_description, '_rollback_manager'):
             del modification_description._rollback_manager
-        if 'replace_regex' in globals() and hasattr(globals()['replace_regex'], '_rollback_manager'):
-            del globals()['replace_regex']._rollback_manager
-        if 'insert_after_regex' in globals() and hasattr(globals()['insert_after_regex'], '_rollback_manager'):
-            del globals()['insert_after_regex']._rollback_manager
-        if 'ensure_line_in_file' in globals() and hasattr(globals()['ensure_line_in_file'], '_rollback_manager'):
-            del globals()['ensure_line_in_file']._rollback_manager
 
 # Interactive rollback interface
 def interactive_rollback():
@@ -989,103 +923,3 @@ def modification_description(description_text):
         modification_description._rollback_manager.accumulate_message(description_text)
     
     logging.debug(f"Added modification description: {description_text}")
-def replace_regex(file_path, pattern, replacement, flags=None):
-    """
-    Regex-based find/replace using Python's re.sub with DOTALL by default.
-
-    Args:
-        file_path (str): Path to file to modify.
-        pattern (str): Python regex pattern.
-        replacement (str): Replacement text (can contain backrefs).
-        flags (int|None): Optional re flags; defaults to re.DOTALL.
-
-    Raises:
-        ValueError: If pattern is not found (causes no textual change).
-    """
-    import re
-    if flags is None:
-        flags = re.DOTALL
-
-    with open(file_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-    new_content, count = re.subn(pattern, replacement, content, flags=flags)
-
-    if count == 0:
-        raise ValueError(f"Pattern not found or no changes made in {file_path}")
-
-    with open(file_path, 'w', encoding='utf-8') as f:
-        f.write(new_content)
-
-    # Track file for git operations
-    if hasattr(replace_regex, '_rollback_manager'):
-        replace_regex._rollback_manager.track_file(file_path)
-def insert_after_regex(file_path, pattern, text_to_insert, flags=None):
-    """
-    Insert text immediately after the first regex match.
-
-    Args:
-        file_path (str): Path to file to modify.
-        pattern (str): Python regex pattern.
-        text_to_insert (str): Text to insert after the match.
-        flags (int|None): Optional re flags; defaults to re.DOTALL|re.MULTILINE.
-
-    Raises:
-        ValueError: If pattern is not found.
-    """
-    import re
-    if flags is None:
-        flags = re.DOTALL | re.MULTILINE
-
-    with open(file_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-    m = re.search(pattern, content, flags)
-    if not m:
-        raise ValueError(f"Pattern not found in {file_path}")
-
-    insert_pos = m.end()
-    new_content = content[:insert_pos] + text_to_insert + content[insert_pos:]
-
-    with open(file_path, 'w', encoding='utf-8') as f:
-        f.write(new_content)
-
-    # Track file for git operations
-    if hasattr(insert_after_regex, '_rollback_manager'):
-        insert_after_regex._rollback_manager.track_file(file_path)
-def ensure_line_in_file(file_path, line):
-    """
-    Ensure an exact line exists in a file; append it if missing.
-
-    Args:
-        file_path (str): Path to file to modify.
-        line (str): Exact line content (without trailing newline).
-
-    Notes:
-        - Adds a trailing newline if the file does not already end in one.
-        - No-op if the exact line already exists.
-    """
-    # Read file contents
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-    except FileNotFoundError:
-        content = ""
-
-    lines = content.splitlines()
-    if line in lines:
-        # Already present; still track for determinism
-        if hasattr(ensure_line_in_file, '_rollback_manager'):
-            ensure_line_in_file._rollback_manager.track_file(file_path)
-        return
-
-    if content and not content.endswith('\n'):
-        content += '\n'
-    content += line + '\n'
-
-    with open(file_path, 'w', encoding='utf-8') as f:
-        f.write(content)
-
-    # Track file for git operations
-    if hasattr(ensure_line_in_file, '_rollback_manager'):
-        ensure_line_in_file._rollback_manager.track_file(file_path)
