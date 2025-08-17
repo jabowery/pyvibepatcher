@@ -33,8 +33,6 @@ class InsertIntoContainer(cst.CSTTransformer):
         return True
 
     def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.BaseStatement:
-        current_name = self.context_stack.pop()
-        
         # Insert into this class if it matches our target chain
         if (not self.inserted and 
             self._matches_insertion_point() and
@@ -46,12 +44,11 @@ class InsertIntoContainer(cst.CSTTransformer):
                 body=updated_node.body.with_changes(body=new_body)
             )
             self.inserted = True
-            
+        
+        self.context_stack.pop()
         return updated_node
 
     def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.BaseStatement:
-        current_name = self.context_stack.pop()
-        
         # Insert into this function if it matches our target chain
         if (not self.inserted and 
             self._matches_insertion_point() and
@@ -64,6 +61,7 @@ class InsertIntoContainer(cst.CSTTransformer):
             )
             self.inserted = True
             
+        self.context_stack.pop()
         return updated_node
 
     def _matches_insertion_point(self) -> bool:
@@ -699,7 +697,6 @@ def declare(file_path, target_path, new_code):
     logging.debug(f'file: {file_path}')
     with open(file_path, 'r') as f:
         content = f.read()
-    
     target_name, lexical_chain = parse_lexical_chain(target_path)
     
     # Try replacement first
@@ -722,7 +719,6 @@ def search_replace(file_path, search_text, replacement_text=''):
     """Search for some text and replace it (supports multiline text wthout escapes)"""
     with open(file_path, 'r') as f:
         content = f.read()
-    
     # Check if search_text exists in content
     if search_text not in content:
         raise ValueError(f"Search text '{search_text}' not found in {file_path}")
