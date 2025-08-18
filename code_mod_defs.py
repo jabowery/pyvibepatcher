@@ -32,6 +32,30 @@ class InsertIntoContainer(cst.CSTTransformer):
         self.context_stack.append(node.name.value)
         return True
 
+    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.BaseStatement:
+        try:
+            if self._matches_insertion_point():
+                # Insert the node into this class
+                new_body = list(updated_node.body.body) + [self.node_to_insert]
+                new_suite = updated_node.body.with_changes(body=new_body)
+                self.inserted = True
+                return updated_node.with_changes(body=new_suite)
+            return updated_node
+        finally:
+            self.context_stack.pop()
+
+    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.BaseStatement:
+        try:
+            if self._matches_insertion_point():
+                # Insert the node into this function
+                new_body = list(updated_node.body.body) + [self.node_to_insert]
+                new_suite = updated_node.body.with_changes(body=new_body)
+                self.inserted = True
+                return updated_node.with_changes(body=new_suite)
+            return updated_node
+        finally:
+            self.context_stack.pop()
+
     def _matches_insertion_point(self) -> bool:
         """Check if current context matches where we want to insert"""
         return self.context_stack == self.lexical_chain
@@ -44,18 +68,7 @@ class GitRollbackManager:
         self.rollback_data = {}
         self.tracked_files = set()
         self.accumulated_message = ""
-        self.accumulated_message = ""
-    def accumulate_message(self, message):
-        """Accumulate message text for commit message"""
-        if self.accumulated_message:
-            self.accumulated_message += "\n" + message
-        else:
-            self.accumulated_message = message
-    def get_accumulated_message(self):
-        """Get and clear accumulated message"""
-        message = self.accumulated_message
-        self.accumulated_message = ""
-        return message
+    
     def accumulate_message(self, message):
         """Accumulate message text for commit message"""
         if self.accumulated_message:
@@ -210,7 +223,6 @@ class GitRollbackManager:
         except subprocess.CalledProcessError:
             return False
     
-
     def soft_rollback(self, commit_hash=None):
         """
         Soft rollback - reset to commit but keep changes staged
@@ -650,7 +662,6 @@ def insert_block(content: str,
         raise ValueError("new_code must contain exactly one top-level def/class.")
 
     node = mod.body[0]
-    is_class = isinstance(node, cst.ClassDef)
 
     module = cst.parse_module(content)
 
@@ -661,7 +672,11 @@ def insert_block(content: str,
         )
     else:
         # Nested insertion - insert into specific container
-        new_module = module.visit(InsertIntoContainer(node, lexical_chain))
+        transformer = InsertIntoContainer(node, lexical_chain)
+        new_module = module.visit(transformer)
+        
+        if not transformer.inserted:
+            raise ValueError(f"Could not find container {'.'.join(lexical_chain)} for insertion")
 
     return new_module.code
 
@@ -943,14 +958,3 @@ if __name__ == "__main__":
     
     if len(sys.argv) > 1 and sys.argv[1] == 'rollback':
         interactive_rollback()
-def modification_description(description_text):
-    """
-    Add description text to the accumulated commit message
-    
-    Args:
-        description_text: Text to append to commit message
-    """
-    if hasattr(modification_description, '_rollback_manager'):
-        modification_description._rollback_manager.accumulate_message(description_text)
-    
-    logging.debug(f"Added modification description: {description_text}")
