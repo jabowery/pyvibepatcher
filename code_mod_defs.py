@@ -537,16 +537,28 @@ def replace_block(content: str,
             inferred_name = node.name.value
         elif isinstance(node, cst.SimpleStatementLine):
             # Check if it's an assignment
-            if (len(node.body) == 1 and isinstance(node.body[0], cst.Assign)):
-                assign_node = node.body[0]
-                if (len(assign_node.targets) == 1 and 
-                    isinstance(assign_node.targets[0].target, cst.Name)):
-                    replacement_node = node
-                    inferred_kind = "assign"
-                    inferred_name = assign_node.targets[0].target.value
-                else:
-                    raise ValueError("new_code must contain a simple assignment to a single variable.")
+            if (len(node.body) == 1):
+                if (isinstance(node.body[0], cst.Assign) or isinstance(node.body[0], cst.AnnAssign)):
+                    assign_node = node.body[0]
+                    if (isinstance(node.body[0], cst.Assign)):
+                        if (len(assign_node.targets) == 1 and 
+                            isinstance(assign_node.targets[0].target, cst.Name)):
+                            replacement_node = node
+                            inferred_kind = "assign"
+                            inferred_name = assign_node.targets[0].target.value
+                        else:
+                            raise ValueError("new_code must contain a simple assignment to a single variable.")
+                    else:
+                        target = assign_node.target
+                        if (isinstance(target, cst.Name)):
+                            replacement_node = node
+                            inferred_kind = "assign"
+                            inferred_name = target.value
+                        else:
+                            raise ValueError("Annotated assignment malformed.")
             else:
+                logging.debug(f"content: {content}")
+                logging.debug(f"new_code: {new_code}")
                 raise ValueError("new_code must contain a function, class, or assignment definition.")
         else:
             logging.debug(f"content: {content}")
@@ -653,37 +665,56 @@ def insert_block(content: str,
 
     return new_module.code
 
-
-def declare(file_path, target_path, new_code):
+def declare(file_path, target_path, new_code=None):
     """
-    Declare a function, class, or assignment in a file with code using lexical chain support.
-    If the target_path exists one or more times, replace all with the new declaration.
-    
+    Declare or remove a function, class, or assignment in a file with code using lexical chain support.
+    If the target_path exists one or more times:
+      - If new_code is not None: replace all with the new declaration.
+      - If new_code is None: delete the declaration.
+
     Args:
         file_path: Path to the Python file
         target_path: Target path like 'function_name', 'ClassName.method_name', or 'variable_name'
-        new_code: New function/class/assignment code defining the declaration's value.
+        new_code: New function/class/assignment code defining the declaration's value, or None to delete it.
     """
+    target_path = target_path.strip() # compensate for multi-line arguments in other modification directives
     logging.debug(f'file: {file_path}')
     with open(file_path, 'r') as f:
         content = f.read()
     target_name, lexical_chain = parse_lexical_chain(target_path)
-    
-    # Try replacement first
-    new_content, was_replaced = replace_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
-    
-    # If replacement didn't happen, insert instead
-    if not was_replaced:
-        new_content = insert_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+    if new_code is None:
+        # Removal mode: try to replace with empty, effectively deleting
+        try:
+            new_content, was_replaced = replace_block(content, "pass", target_name=target_name, lexical_chain=lexical_chain)
+            if was_replaced:
+                # Remove the inserted "pass" line if it exists standalone
+                pattern = re.compile(rf'(^\s*def {target_name}.*?:\n)(\s*pass\n)', re.MULTILINE)
+                new_content = pattern.sub(r'\1', new_content)
+                pattern = re.compile(rf'(^\s*class {target_name}.*?:\n)(\s*pass\n)', re.MULTILINE)
+                new_content = pattern.sub(r'', new_content)
+                # Remove assignments
+                new_content = re.sub(rf'^.*{target_name}.*=.*$\n?', '', new_content, flags=re.MULTILINE)
+            else:
+                logging.warning(f"Declaration {target_path} not found for removal")
+        except Exception as e:
+            logging.error(f"Error removing {target_path}: {e}")
+            new_content = content
+    else:
+        # Normal insert/replace mode
+        new_content, was_replaced = replace_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+        if not was_replaced:
+            new_content = insert_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
 
     with open(file_path, 'w') as f:
         f.write(new_content)
-    
+
     # Track file for git operations
     if hasattr(declare, '_rollback_manager'):
         declare._rollback_manager.track_file(file_path)
-    
+
     logging.debug(f"Declared {target_path} in {file_path}")
+
+
 
 def move_file(src, dst):
     """Move/rename file or directory"""

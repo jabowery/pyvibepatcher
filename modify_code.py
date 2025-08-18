@@ -29,7 +29,6 @@ def parse_modification_file(file_path):
         args = re.split(r'@{6}\n', block_content)
         args[0] = args[0].strip()
         #args = [arg for arg in args]
-        
         # Get function from globals
         if function_name in globals():
             func = globals()[function_name]

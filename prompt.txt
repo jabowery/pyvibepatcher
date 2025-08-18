@@ -31,10 +31,11 @@ update_file(path, file_content)
 
 Code Modifications
 
-declare(file_path, target_path, new_code)
+declare(file_path, target_path [, new_code])
     Declare a function, class, or assignment in a file with code using lexical chain support.
     If the target_path exists one or more times, replace all with the new declaration.
     target_path: Use dot notation for nested items (e.g., "ClassName.method_name")
+    If the optional new_code is omitted, the declaration will be deleted.
 
 Example Modification File
 
