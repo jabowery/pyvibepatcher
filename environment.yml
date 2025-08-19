@@ -1,0 +1,8 @@
+name: pycoder
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - libcst
+  - pytest
+  - pytest-cov

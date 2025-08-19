@@ -15,6 +15,123 @@ from typing import Optional, List
 
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
 
+import libcst as cst
+from typing import Tuple, List
+
+
+# near other LibCST helpers
+def _target_exists(source: str, target_name: str, chain: list[str]) -> bool:
+    try:
+        mod = cst.parse_module(source)
+    except Exception:
+        return False
+
+    class _Finder(cst.CSTVisitor):
+        def __init__(self):
+            self.stack = []
+            self.found = False
+        def visit_ClassDef(self, node: cst.ClassDef) -> None:
+            self.stack.append(node.name.value)
+        def leave_ClassDef(self, node: cst.ClassDef) -> None:
+            self.stack.pop()
+        def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
+            if node.name.value == target_name and (self.stack == chain or (not chain and not self.stack)):
+                self.found = True
+        def visit_SimpleStatementLine(self, node: cst.SimpleStatementLine) -> None:
+            if len(node.body) == 1 and isinstance(node.body[0], cst.Assign):
+                for t in node.body[0].targets:
+                    if isinstance(t.target, cst.Name) and t.target.value == target_name and (self.stack == chain or (not chain and not self.stack)):
+                        self.found = True
+
+    f = _Finder()
+    mod.visit(f)
+    return f.found
+
+
+def _is_assignment_to_name(stmt: cst.CSTNode, name: str) -> bool:
+    # Match: x = ...   (within a SimpleStatementLine)
+    if not isinstance(stmt, cst.SimpleStatementLine):
+        return False
+    for small in stmt.body:
+        if isinstance(small, cst.Assign):
+            for t in small.targets:
+                tgt = t.target
+                if isinstance(tgt, cst.Name) and tgt.value == name:
+                    return True
+    return False
+
+
+class _DeletionTransformer(cst.CSTTransformer):
+    """
+    Removes a declaration at the given lexical chain.
+    - lexical_chain == []  => operate at module level
+    - lexical_chain == ["A", "B"] => operate inside class A.B
+    Deletes:
+      * FunctionDef with matching name
+      * Assign to matching name (top-level or inside class scope)
+    """
+    def __init__(self, target_name: str, lexical_chain: List[str]):
+        self.target_name = target_name
+        self.chain = lexical_chain
+        self.class_stack: List[str] = []
+        self.removed = False
+
+    # Track the current class stack
+    def visit_ClassDef(self, node: cst.ClassDef) -> None:
+        self.class_stack.append(node.name.value)
+
+    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.CSTNode:
+        # If we are exactly inside the desired class chain, filter this class body
+        if self.class_stack == self.chain:
+            new_body = []
+            for stmt in updated_node.body.body:
+                # Remove function with matching name
+                if isinstance(stmt, cst.FunctionDef) and stmt.name.value == self.target_name:
+                    self.removed = True
+                    continue
+                # Remove assignment to matching name
+                if _is_assignment_to_name(stmt, self.target_name):
+                    self.removed = True
+                    continue
+                new_body.append(stmt)
+            updated_node = updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
+        # Pop class stack on exit
+        self.class_stack.pop()
+        return updated_node
+
+    def leave_Module(self, original_node: cst.Module, updated_node: cst.Module) -> cst.CSTNode:
+        # Only act at module level when no class chain was requested
+        if len(self.chain) == 0:
+            new_body = []
+            for stmt in updated_node.body:
+                if isinstance(stmt, cst.FunctionDef) and stmt.name.value == self.target_name:
+                    self.removed = True
+                    continue
+                if _is_assignment_to_name(stmt, self.target_name):
+                    self.removed = True
+                    continue
+                # We do NOT remove classes at module level by name here; deletion of a class
+                # itself can be supported similarly if needed.
+                new_body.append(stmt)
+            updated_node = updated_node.with_changes(body=new_body)
+        return updated_node
+
+
+def remove_block(source: str, target_name: str, lexical_chain: List[str]) -> Tuple[str, bool]:
+    """
+    Remove a function/method/assignment designated by (lexical_chain, target_name).
+    Returns: (new_source, removed_bool)
+    """
+    try:
+        mod = cst.parse_module(source)
+    except Exception:
+        # If parsing fails, do nothing
+        return source, False
+    tr = _DeletionTransformer(target_name, lexical_chain)
+    new_mod = mod.visit(tr)
+    return new_mod.code, tr.removed
+
+
 class InsertIntoContainer(cst.CSTTransformer):
     """Insert a node into a specific container in the AST"""
     
@@ -410,108 +527,84 @@ def parse_lexical_chain(target_path: str) -> tuple[str, List[str]]:
     
     return parts[-1], parts[:-1]
 
+import libcst as cst
+from typing import List, Optional
+
 class ReplaceDeclaration(cst.CSTTransformer):
-    def __init__(self, target_name: str, new_code: str,
-                 kind: Optional[str] = None, lexical_chain: Optional[List[str]] = None):
-        """
-    target_name: name of function, class, or variable to replace.
-    new_code: the full new def/class/assignment code (including decorators if any).
-    kind: "def", "class", or "assign" (if None, inferred from new_code).
-    lexical_chain: list of container names to traverse (e.g., ['ClassName'] for ClassName.method_name)
     """
-        mod = cst.parse_module(new_code)
-        if len(mod.body) != 1:
-            raise ValueError("new_code must contain exactly one top-level def/class/assignment.")
-        self.replacement = mod.body[0]
-        
-        if kind is None:
-            if isinstance(self.replacement, cst.FunctionDef):
-                kind = "def"
-            elif isinstance(self.replacement, cst.ClassDef):
-                kind = "class"
-            elif isinstance(self.replacement, cst.SimpleStatementLine):
-                # Check if it's an assignment
-                if (len(self.replacement.body) == 1 and 
-                    isinstance(self.replacement.body[0], cst.Assign)):
-                    kind = "assign"
-                else:
-                    raise ValueError("new_code must be a function, class, or assignment statement.")
-            else:
-                raise ValueError("new_code must be a function, class, or assignment statement.")
-        
-        self.kind = kind
+    Replace a function/method/assignment designated by (lexical_chain, target_name).
+    Supports:
+      - Module-level def/assign
+      - Method/assign inside a class chain like A.B (self.chain == ["A","B"])
+    """
+    def __init__(self, target_name: str, lexical_chain: List[str], new_code: str, kind: Optional[str] = None):
         self.target_name = target_name
-        self.lexical_chain = lexical_chain or []
-        self.context_stack: List[str] = []
-        self.found_count = 0
-        self.replaced = False
+        self.chain = lexical_chain or []
+        self.new_code = new_code
+        self.kind = kind
+        self.class_stack: List[str] = []
+        self.replaced = False  # <-- add this
 
-    def visit_ClassDef(self, node: cst.ClassDef) -> bool:
-        self.context_stack.append(node.name.value)
-        return True
-
-    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
-        self.context_stack.append(node.name.value)
-        return True
-
-    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.BaseStatement:
-        # Replace class definition if it matches (compare against containers, excluding this class)
         try:
-            if (self.kind == "class"
-                and original_node.name.value == self.target_name
-                and self._matches_containers(exclude_current=True)):
-                self.found_count += 1
-                self.replaced = True
-                if self.found_count > 1:
-                    logging.warning(f"Multiple definitions found for {self.target_name}, replacing all instances")
-                return self.replacement.with_changes(leading_lines=original_node.leading_lines)
-            return updated_node
-        finally:
-            self.context_stack.pop()
+            self._replacement_module = cst.parse_module(self.new_code)
+        except Exception:
+            self._replacement_module = None
 
-    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.BaseStatement:
-        # Replace function/method if it matches (compare against containers, excluding this function)
-        try:
-            if (self.kind == "def"
-                and original_node.name.value == self.target_name
-                and self._matches_containers(exclude_current=True)):
-                self.found_count += 1
-                self.replaced = True
-                if self.found_count > 1:
-                    logging.warning(f"Multiple definitions found for {self.target_name}, replacing all instances")
-                return self.replacement.with_changes(leading_lines=original_node.leading_lines)
-            return updated_node
-        finally:
-            self.context_stack.pop()
+    # ---- context tracking for lexical chain ----
+    def visit_ClassDef(self, node: cst.ClassDef) -> None:
+        self.class_stack.append(node.name.value)
 
+    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.CSTNode:
+        # Replace methods/assignments inside the matched class chain is handled in the leaf visitors
+        self.class_stack.pop()
+        return updated_node
+
+    def _matches_lexical_chain(self) -> bool:
+        # For module-level targets, require we are NOT inside any class
+        if not self.chain:
+            return len(self.class_stack) == 0
+        # For nested class targets, require the current stack equals the chain
+        return self.class_stack == self.chain
+
+    # ---- helpers to extract replacement nodes from new_code ----
+    def _first_funcdef(self) -> Optional[cst.FunctionDef]:
+        if not self._replacement_module:
+            return None
+        for stmt in self._replacement_module.body:
+            if isinstance(stmt, cst.FunctionDef):
+                return stmt
+        return None
+
+    def _first_assign_stmtline(self) -> Optional[cst.SimpleStatementLine]:
+        if not self._replacement_module:
+            return None
+        for stmt in self._replacement_module.body:
+            if isinstance(stmt, cst.SimpleStatementLine) and stmt.body and isinstance(stmt.body[0], cst.Assign):
+                return stmt
+        return None
+
+    # ---- replacements ----
+    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.CSTNode:
+        # Replace a function (module-level or method) if names and lexical chain match
+        if self.kind in (None, "func", "def"):
+            if original_node.name.value == self.target_name and self._matches_lexical_chain():
+                rep = self._first_funcdef()
+                if rep is not None:
+                    return rep
+        return updated_node
 
     def leave_SimpleStatementLine(self, original_node: cst.SimpleStatementLine, updated_node: cst.SimpleStatementLine) -> cst.BaseStatement:
-        # Handle assignment statements
-        if (self.kind == "assign" and len(updated_node.body) == 1 and 
-            isinstance(updated_node.body[0], cst.Assign)):
-            
-            assign_node = updated_node.body[0]
-            
-            # Check if any target matches our target_name
-            for target in assign_node.targets:
-                if isinstance(target.target, cst.Name) and target.target.value == self.target_name:
-                    if self._matches_lexical_chain():
-                        self.found_count += 1
-                        self.replaced = True
-                        if self.found_count > 1:
-                            logging.warning(f"Multiple definitions found for {self.target_name}, replacing all instances")
-                        return self.replacement.with_changes(leading_lines=original_node.leading_lines)
-        
+        if self.kind in (None, "assign"):
+            if len(updated_node.body) == 1 and isinstance(updated_node.body[0], cst.Assign):
+                assign_node = updated_node.body[0]
+                for tgt in assign_node.targets:
+                    if isinstance(tgt.target, cst.Name) and tgt.target.value == self.target_name:
+                        if self._matches_lexical_chain():
+                            rep = self._first_assign_stmtline()
+                            if rep is not None:
+                                self.replaced = True  # <-- set
+                                return rep
         return updated_node
-    
-    def _matches_containers(self, exclude_current: bool = False) -> bool:
-        """Compare lexical_chain against the container context (optionally excluding the current node)."""
-        stack = self.context_stack[:-1] if exclude_current else self.context_stack
-        if not self.lexical_chain:
-            return True
-        if len(stack) < len(self.lexical_chain):
-            return False
-        return stack[-len(self.lexical_chain):] == self.lexical_chain
 
 
 def replace_block(content: str,
@@ -634,11 +727,30 @@ def replace_block(content: str,
     
     # Create a version of new_code with just the replacement node for the transformer
     single_node_code = cst.Module(body=[replacement_node]).code
-    
-    transformer = ReplaceDeclaration(target_name, single_node_code, kind=kind, lexical_chain=lexical_chain)
+
+    transformer = ReplaceDeclaration(
+        target_name=target_name,
+        lexical_chain=lexical_chain or [],
+        new_code=single_node_code,
+        kind=kind,
+    )
+    module = cst.parse_module(content)
     new_module = module.visit(transformer)
-    
-    return new_module.code, transformer.replaced
+
+    # Primary path result
+    if transformer.replaced:
+        return new_module.code, True
+
+    # If the target exists but we didn't mark replaced, do a robust fallback:
+    if _target_exists(content, target_name, lexical_chain or []):
+        # 1) remove the old target in the right scope
+        stripped, _ = remove_block(content, target_name, lexical_chain or [])
+        # 2) insert the new one
+        inserted = insert_block(stripped, new_code, target_name=target_name, lexical_chain=lexical_chain or [])
+        return inserted, True
+
+    # Otherwise: no target to replace (caller can decide to insert)
+    return content, False
 
 def insert_block(content: str,
                  new_code: str,
@@ -682,52 +794,32 @@ def insert_block(content: str,
 
 def declare(file_path, target_path, new_code=None):
     """
-    Declare or remove a function, class, or assignment in a file with code using lexical chain support.
-    If the target_path exists one or more times:
-      - If new_code is not None: replace all with the new declaration.
-      - If new_code is None: delete the declaration.
-
-    Args:
-        file_path: Path to the Python file
-        target_path: Target path like 'function_name', 'ClassName.method_name', or 'variable_name'
-        new_code: New function/class/assignment code defining the declaration's value, or None to delete it.
+    Declare a function, class, or assignment in a file with code using lexical chain support.
+    If the target_path exists one or more times, replace all with the new declaration.
+    If new_code is None, the declaration is deleted.
     """
-    target_path = target_path.strip() # compensate for multi-line arguments in other modification directives
     logging.debug(f'file: {file_path}')
     with open(file_path, 'r') as f:
         content = f.read()
     target_name, lexical_chain = parse_lexical_chain(target_path)
+
+    # ----- DELETE fast-path -----
     if new_code is None:
-        # Removal mode: try to replace with empty, effectively deleting
-        try:
-            new_content, was_replaced = replace_block(content, "pass", target_name=target_name, lexical_chain=lexical_chain)
-            if was_replaced:
-                # Remove the inserted "pass" line if it exists standalone
-                pattern = re.compile(rf'(^\s*def {target_name}.*?:\n)(\s*pass\n)', re.MULTILINE)
-                new_content = pattern.sub(r'\1', new_content)
-                pattern = re.compile(rf'(^\s*class {target_name}.*?:\n)(\s*pass\n)', re.MULTILINE)
-                new_content = pattern.sub(r'', new_content)
-                # Remove assignments
-                new_content = re.sub(rf'^.*{target_name}.*=.*$\n?', '', new_content, flags=re.MULTILINE)
-            else:
-                logging.warning(f"Declaration {target_path} not found for removal")
-        except Exception as e:
-            logging.error(f"Error removing {target_path}: {e}")
-            new_content = content
-    else:
-        # Normal insert/replace mode
-        new_content, was_replaced = replace_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
-        if not was_replaced:
-            new_content = insert_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+        new_content, removed = remove_block(content, target_name, lexical_chain)
+        if not removed:
+            # Nothing removed; keep content unchanged but surface a clear error for callers/logs
+            logging.error(f"Error removing {target_name}: target not found at chain {'.'.join(lexical_chain) or '<module>'}")
+        with open(file_path, 'w') as f:
+            f.write(new_content)
+        return
+
+    # ----- REPLACE or INSERT -----
+    new_content, was_replaced = replace_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+    if not was_replaced:
+        new_content = insert_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
 
     with open(file_path, 'w') as f:
         f.write(new_content)
-
-    # Track file for git operations
-    if hasattr(declare, '_rollback_manager'):
-        declare._rollback_manager.track_file(file_path)
-
-    logging.debug(f"Declared {target_path} in {file_path}")
 
 
 
