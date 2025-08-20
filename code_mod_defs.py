@@ -207,7 +207,6 @@ class GitRollbackManager:
             return bool(result.stdout.strip())
         except subprocess.CalledProcessError:
             return False
-
     def create_rollback_point(self, message=None, force_commit=False):
         """
         Create a git commit as a rollback point
@@ -242,6 +241,21 @@ class GitRollbackManager:
         except subprocess.CalledProcessError:
             raise RuntimeError("Git user.name and user.email must be configured")
         
+        # If this is the initial rollback point creation (no existing rollback data), 
+        # save current commit as the rollback point
+        is_initial_rollback = not bool(self.rollback_data.get('commit_hash'))
+        
+        if is_initial_rollback:
+            self.rollback_data = {
+                'commit_hash': current_commit,
+                'branch': current_branch,
+                'timestamp': timestamp,
+                'message': f"Initial rollback point: {message}",
+                'was_clean': True
+            }
+            self._save_rollback_data()
+            logging.info(f"Created rollback point: {current_commit}")
+        
         # Add only tracked files to staging
         if self.tracked_files:
             for file_path in self.tracked_files:
@@ -260,13 +274,7 @@ class GitRollbackManager:
         
         if not has_staged and not force_commit:
             logging.info("No staged changes, using current HEAD as rollback point")
-            rollback_info = {
-                'commit_hash': current_commit,
-                'branch': current_branch,
-                'timestamp': timestamp,
-                'message': f"Rollback point (no changes): {message}",
-                'was_clean': True
-            }
+            return self.rollback_data
         else:
             if not has_staged:
                 # force_commit=True but no staged changes - create empty commit
@@ -285,20 +293,27 @@ class GitRollbackManager:
             if not new_commit:
                 raise RuntimeError("Failed to get commit hash after successful commit")
             
-            rollback_info = {
-                'commit_hash': new_commit,
-                'branch': current_branch,
-                'timestamp': timestamp,
-                'message': message,
-                'was_clean': False
-            }
-        
-        # Save rollback info to file
-        self.rollback_data = rollback_info
-        self._save_rollback_data()
-        
-        logging.info(f"Created rollback point: {rollback_info['commit_hash']}")
-        return rollback_info
+            logging.info(f"Created commit: {new_commit}")
+            
+            # For backward compatibility: if this was the initial call AND we created a commit,
+            # return info about the new commit. Otherwise, return original rollback data.
+            if is_initial_rollback:
+                # Update rollback data to point to the new commit for compatibility
+                updated_rollback_info = {
+                    'commit_hash': new_commit,
+                    'branch': current_branch,
+                    'timestamp': timestamp,
+                    'message': message,
+                    'was_clean': False
+                }
+                self.rollback_data = updated_rollback_info
+                self._save_rollback_data()
+                return updated_rollback_info
+            else:
+                # Return original rollback point for successive calls
+                return self.rollback_data
+
+
 
     def track_file(self, file_path):
         """Track a file for inclusion in git commits"""
@@ -799,6 +814,11 @@ def declare(file_path, target_path, new_code=None):
     If new_code is None, the declaration is deleted.
     """
     logging.debug(f'file: {file_path}')
+    
+    # Track file for git operations BEFORE modifying it
+    if hasattr(declare, '_rollback_manager'):
+        declare._rollback_manager.track_file(file_path)
+    
     with open(file_path, 'r') as f:
         content = f.read()
     target_name, lexical_chain = parse_lexical_chain(target_path)
@@ -814,14 +834,22 @@ def declare(file_path, target_path, new_code=None):
         return
 
     # ----- REPLACE or INSERT -----
-    new_content, was_replaced = replace_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
-    if not was_replaced:
-        new_content = insert_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+    # Force fallback for assignments since replace_block is broken for them
+    if target_name in content and '=' in new_code:
+        # Likely an assignment, use the working fallback path
+        new_content, removed = remove_block(content, target_name, lexical_chain)
+        if removed:
+            new_content = insert_block(new_content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+        else:
+            new_content = insert_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+    else:
+        # Use normal replace logic for functions
+        new_content, was_replaced = replace_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+        if not was_replaced:
+            new_content = insert_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
 
     with open(file_path, 'w') as f:
         f.write(new_content)
-
-
 
 def move_file(src, dst):
     """Move/rename file or directory"""
@@ -868,13 +896,15 @@ def modification_description(description_text):
     
     logging.debug(f"Added modification description: {description_text}")
 
-def apply_modification_set(modifications, auto_rollback_on_failure=True):
+def apply_modification_set(modifications, auto_rollback_on_failure=True, auto_commit=None, commit_message=None):
     """
     Apply a set of modifications with rollback support
     
     Args:
         modifications: List of (function, args, kwargs) tuples
         auto_rollback_on_failure: If True, automatically rollback on any failure
+        auto_commit: If True, force commit even if no files tracked. If None, use existing logic.
+        commit_message: Override commit message. If None, use accumulated descriptions.
         
     Returns:
         GitRollbackManager: Manager instance for manual rollback operations
@@ -916,12 +946,22 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True):
             print(func)
             func(*args, **kwargs)
         
-        # Create final commit with tracked files and accumulated message
-        if rollback_manager.tracked_files:
-            commit_message = rollback_manager.get_accumulated_message()
-            if not commit_message:
-                commit_message = "After LLM modifications"
-            rollback_manager.create_rollback_point(commit_message, force_commit=True)
+        # Determine if we should commit
+        should_commit = False
+        if auto_commit is True:
+            should_commit = True
+        elif auto_commit is None and rollback_manager.tracked_files:
+            should_commit = True
+        
+        # Create final commit if needed
+        if should_commit:
+            final_commit_message = commit_message
+            if not final_commit_message:
+                final_commit_message = rollback_manager.get_accumulated_message()
+            if not final_commit_message:
+                final_commit_message = "After LLM modifications"
+            
+            rollback_manager.create_rollback_point(final_commit_message, force_commit=True)
         
         logging.info("All modifications completed successfully")
         rollback_manager.show_rollback_options()

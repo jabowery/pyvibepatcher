@@ -16,6 +16,10 @@ from code_mod_defs import (
     modification_description,
     create_file,
     move_file,
+    declare,
+    update_file,
+    make_directory,
+    remove_file,
     # add others here as you introduce them
 )
 
@@ -59,6 +63,10 @@ def _resolve_func(name: str):
         "modification_description": modification_description,
         "create_file": create_file,
         "move_file": move_file,
+        "declare": declare,
+        "update_file": update_file,
+        "make_directory": make_directory,
+        "remove_file": remove_file,
     }
     if name not in table:
         raise ValueError(f"Unknown modification function: {name}")
@@ -119,6 +127,15 @@ def parse_modification_file(path: str):
             args = (path_arg, content_arg)
             kwargs = {"make_executable": make_exec}
 
+        elif fn is update_file:
+            if len(sections) < 2:
+                raise ValueError("update_file requires at least 2 sections: path, content, [make_executable].")
+            path_arg = sections[0].strip()
+            content_arg = sections[1]  # preserve newlines
+            make_exec = _parse_bool(sections[2]) if len(sections) >= 3 else False
+            args = (path_arg, content_arg)
+            kwargs = {"make_executable": make_exec}
+
         elif fn is move_file:
             if len(sections) < 2:
                 raise ValueError("move_file requires 2 sections: src, dst.")
@@ -126,6 +143,30 @@ def parse_modification_file(path: str):
             dst = sections[1].strip()
             args = (src, dst)
             kwargs = {}
+
+        elif fn is declare:
+            if len(sections) < 3:
+                raise ValueError("declare requires 3 sections: file_path, name, content (or None for deletion).")
+            file_path = sections[0].strip()
+            name = sections[1].strip()
+            content = sections[2] if sections[2].strip() else None  # treat empty content as None for deletion
+            args = (file_path, name, content)
+            kwargs = {}
+
+        elif fn is make_directory:
+            if len(sections) < 1:
+                raise ValueError("make_directory requires 1 section: path.")
+            path_arg = sections[0].strip()
+            args = (path_arg,)
+            kwargs = {}
+
+        elif fn is remove_file:
+            if len(sections) < 1:
+                raise ValueError("remove_file requires at least 1 section: path, [recursive].")
+            path_arg = sections[0].strip()
+            recursive = _parse_bool(sections[1]) if len(sections) >= 2 else False
+            args = (path_arg,)
+            kwargs = {"recursive": recursive}
 
         else:
             # Fallback: all sections as positional strings
@@ -138,7 +179,6 @@ def parse_modification_file(path: str):
         raise ValueError("No modification blocks found in file.")
 
     return entries
-
 
 
 def main():
@@ -158,5 +198,3 @@ if __name__ == "__main__":
         interactive_rollback()
     else:
         main()
-
-

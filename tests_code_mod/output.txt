@@ -1,0 +1,355 @@
+File: conftest.py
+import os
+import sys
+import subprocess
+import tempfile
+import shutil
+import contextlib
+from pathlib import Path
+
+import pytest
+
+# Ensure the uploaded modules are importable
+PROJECT_ROOT = Path("/mnt/data")
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+@contextlib.contextmanager
+def chdir(path: Path):
+    prev = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(prev)
+
+@pytest.fixture()
+def tmp_git_repo(tmp_path, monkeypatch):
+    """Initialize a temporary git repo with configured identity and an initial commit.
+    Yields: (repo_path: Path, chdir_ctx: contextmanager)
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.check_call(["git", "init"], cwd=repo)
+    subprocess.check_call(["git", "config", "user.name", "Test User"], cwd=repo)
+    subprocess.check_call(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+    (repo / "README.md").write_text("# temp\n")
+    subprocess.check_call(["git", "add", "README.md"], cwd=repo)
+    subprocess.check_call(["git", "commit", "-m", "init"], cwd=repo)
+
+    yield repo, chdir
+
+
+File: missing_commit_test.py
+import subprocess
+import pytest
+from pathlib import Path
+
+from code_mod_defs import apply_modification_set, create_file, modification_description, declare
+
+def test_modifications_create_new_commit(tmp_git_repo):
+    """This test should have caught that modifications weren't being committed."""
+    repo, chdir = tmp_git_repo
+    with chdir(repo):
+        # Get initial commit
+        initial_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+        
+        # Apply modifications
+        mods = [
+            (modification_description, ("Add test file",), {}),
+            (create_file, ("test.txt", "Hello World",), {"make_executable": False}),
+        ]
+        
+        # This should create a new commit (but currently doesn't!)
+        manager = apply_modification_set(mods, auto_commit=True, commit_message="Add test file")
+        
+        # Get commit after modifications
+        final_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+        
+        # CRITICAL: This should fail with current code because no commit was made
+        assert final_commit != initial_commit, "Expected new commit to be created after modifications"
+        
+        # Verify the file was actually committed
+        committed_files = subprocess.check_output(
+            ["git", "ls-tree", "--name-only", "HEAD"], text=True
+        ).strip().split('\n')
+        assert "test.txt" in committed_files, "Modified file should be in the new commit"
+        
+        # Verify commit message
+        commit_msg = subprocess.check_output(
+            ["git", "log", "-1", "--pretty=format:%s"], text=True
+        ).strip()
+        assert commit_msg == "Add test file", f"Expected commit message 'Add test file', got '{commit_msg}'"
+
+def test_rollback_points_are_different_after_commits(tmp_git_repo):
+    """Test that successive modification runs create different rollback points."""
+    repo, chdir = tmp_git_repo
+    with chdir(repo):
+        # First modification
+        mods1 = [
+            (modification_description, ("First change",), {}),
+            (create_file, ("file1.txt", "Content 1",), {"make_executable": False}),
+        ]
+        manager1 = apply_modification_set(mods1, auto_commit=True, commit_message="First change")
+        rollback1 = manager1.rollback_data.get("commit_hash")
+        
+        # Second modification (should start from new HEAD)
+        mods2 = [
+            (modification_description, ("Second change",), {}),
+            (create_file, ("file2.txt", "Content 2",), {"make_executable": False}),
+        ]
+        manager2 = apply_modification_set(mods2, auto_commit=True, commit_message="Second change")
+        rollback2 = manager2.rollback_data.get("commit_hash")
+        
+        # Rollback points should be different because HEAD changed between runs
+        assert rollback1 != rollback2, "Rollback points should be different after commits"
+        
+        # Current HEAD should be different from both rollback points
+        current_head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+        assert current_head != rollback1, "Current HEAD should be beyond first rollback point"
+        assert current_head != rollback2, "Current HEAD should be beyond second rollback point"
+
+def test_main_script_behavior_integration(tmp_git_repo, tmp_path):
+    """Integration test that simulates the actual script usage."""
+    repo, chdir = tmp_git_repo
+    with chdir(repo):
+        # Create a modification file like the user would
+        mod_file = tmp_path / "test_mods.txt"
+        mod_file.write_text("""
+MMM modification_description MMM
+Integration test modification
+@@@@@@
+MMM create_file MMM
+integration_test.py
+@@@@@@
+def test_function():
+    return "test"
+@@@@@@
+False
+""".strip())
+        
+        # Get initial state
+        initial_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+        
+        # Simulate what the main script does
+        from modify_code import parse_modification_file
+        modifications = parse_modification_file(str(mod_file))
+        
+        # Extract description (like the fixed main() does)
+        description = "Code modifications"
+        if modifications and modifications[0][0].__name__ == 'modification_description':
+            description = modifications[0][1][0]
+        
+        # Apply with auto_commit=True (like the fixed script should do)
+        manager = apply_modification_set(modifications, auto_commit=True, commit_message=description)
+        
+        # Verify new commit was created
+        final_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+        
+        assert final_commit != initial_commit, "Script should create new commit"
+        assert Path("integration_test.py").exists(), "File should be created"
+        
+        # Verify file is committed
+        committed_files = subprocess.check_output(
+            ["git", "ls-tree", "--name-only", "HEAD"], text=True
+        ).strip().split('\n')
+        assert "integration_test.py" in committed_files, "File should be committed"
+
+
+File: test_apply_modification_set.py
+from pathlib import Path
+import subprocess
+import pytest
+
+from code_mod_defs import apply_modification_set, create_file, move_file, remove_file, modification_description
+
+def test_apply_modification_set_success(tmp_git_repo):
+    repo, chdir = tmp_git_repo
+    with chdir(repo):
+        Path("dst").mkdir(parents=True, exist_ok=True)
+        mods = [
+            (modification_description, ("create and move files",), {}),
+            (create_file, ("src/a.txt", "A",), {"make_executable": False}),
+            (create_file, ("src/b.txt", "B",), {"make_executable": False}),
+            (move_file, ("src/a.txt", "dst/a.txt"), {}),
+            (remove_file, ("src", True), {}),
+        ]
+        mgr = apply_modification_set(mods, auto_rollback_on_failure=True)
+        assert Path("dst/a.txt").exists()
+        assert not Path("src").exists()
+        assert mgr.rollback_data.get("commit_hash")
+
+def test_apply_modification_set_failure_rolls_back(tmp_git_repo):
+    repo, chdir = tmp_git_repo
+    with chdir(repo):
+        initial_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+
+        mods = [
+            (create_file, ("x.txt", "X",), {"make_executable": False}),
+            (move_file, ("does_not_exist.txt", "y.txt"), {}),
+        ]
+        with pytest.raises(Exception):
+            apply_modification_set(mods, auto_rollback_on_failure=True)
+
+        # HEAD should remain the same (no new commit was added)
+        head_after = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+        assert head_after == initial_commit
+
+        # The file may exist untracked; ensure it was NOT staged/committed
+        tracked = subprocess.check_output(["git", "ls-files", "x.txt"], text=True).strip()
+        assert tracked == ""
+
+
+File: test_declare_basic.py
+import textwrap
+from pathlib import Path
+
+from code_mod_defs import declare, parse_lexical_chain
+
+def test_parse_lexical_chain_top_level():
+    name, chain = parse_lexical_chain("foo")
+    assert name == "foo" and chain == []
+
+def test_parse_lexical_chain_nested():
+    name, chain = parse_lexical_chain("A.b.c")
+    assert name == "c" and chain == ["A", "b"]
+
+def test_replace_insert_delete_roundtrip(tmp_path):
+    p = tmp_path / "m.py"
+    p.write_text("")
+    # insert a top-level def
+    declare(str(p), "foo", textwrap.dedent("""
+    def foo():
+        return 1
+    """))
+    s = p.read_text()
+    assert "def foo" in s and "return 1" in s
+
+    # replace the def
+    declare(str(p), "foo", textwrap.dedent("""
+    def foo():
+        return 2
+    """))
+    s = p.read_text()
+    assert "return 2" in s and "return 1" not in s
+
+    # delete the def
+    declare(str(p), "foo", None)
+    s = p.read_text()
+    assert "def foo" not in s
+
+def test_nested_insertion_and_deletion(tmp_path):
+    p = tmp_path / "n.py"
+    p.write_text(textwrap.dedent("""
+    class A:
+        def b(self):
+            x = 1
+    """))
+    # insert a method c into A
+    declare(str(p), "A.c", textwrap.dedent("""
+    def c(self):
+        return 'ok'
+    """))
+    s = p.read_text()
+    assert "def c(self)" in s
+
+    # delete method b
+    declare(str(p), "A.b", None)
+    s = p.read_text()
+    assert "def b(" not in s
+
+def test_assignment_replace_and_delete(tmp_path):
+    p = tmp_path / "v.py"
+    p.write_text("x = 1\ny = 2\n")
+    # replace assignment to x
+    declare(str(p), "x", "x = 42\n")
+    s = p.read_text()
+    assert "x = 42" in s and "y = 2" in s
+    # delete y
+    declare(str(p), "y", None)
+    s = p.read_text()
+    assert "y = 2" not in s
+
+
+File: test_git_rollback_manager.py
+from pathlib import Path
+import subprocess
+
+from code_mod_defs import GitRollbackManager, create_file
+
+def test_create_rollback_points_no_changes(tmp_git_repo):
+    repo, chdir = tmp_git_repo
+    with chdir(repo):
+        mgr = GitRollbackManager()
+        info = mgr.create_rollback_point("snapshot")
+        assert "commit_hash" in info and info["was_clean"] is True
+
+def test_commit_tracked_files_and_hard_rollback(tmp_git_repo):
+    repo, chdir = tmp_git_repo
+    with chdir(repo):
+        mgr = GitRollbackManager()
+        mgr.track_file("a.txt")
+        create_file._rollback_manager = mgr  # simulate apply_modification_set attaching tracking
+        create_file("a.txt", "hello", make_executable=False)
+
+        # Create rollback point commit that includes a.txt="hello"
+        info = mgr.create_rollback_point("after create", force_commit=True)
+        commit_after = mgr.get_current_commit()
+        assert commit_after == info["commit_hash"]
+
+        # Dirty the working tree
+        Path("a.txt").write_text("changed")
+
+        # Roll back to the rollback point commit (not HEAD~1)
+        ok = mgr.hard_rollback(info["commit_hash"])
+        assert ok
+        assert Path("a.txt").read_text() == "hello"
+
+
+
+File: test_modify_code_parser.py
+from modify_code import parse_modification_file
+
+SAMPLE = """\
+MMM modification_description MMM
+Describe the change
+@@@@@@
+MMM create_file MMM
+path/to/file.txt
+@@@@@@
+content here
+@@@@@@
+False
+@@@@@@
+MMM move_file MMM
+path/to/file.txt
+@@@@@@
+new/place.txt
+"""
+
+def test_parse_modification_file(tmp_path):
+    mfile = tmp_path / "mods.txt"
+    mfile.write_text(SAMPLE)
+    mods = parse_modification_file(str(mfile))
+    funcs = [m[0].__name__ for m in mods]
+    assert funcs == ["modification_description", "create_file", "move_file"]
+    assert mods[1][1][0].strip() == "path/to/file.txt"
+    assert mods[1][1][1].strip() == "content here"
+    assert mods[2][1][1].strip() == "new/place.txt"
+
+
