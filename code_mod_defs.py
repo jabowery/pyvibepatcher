@@ -767,12 +767,14 @@ def replace_block(content: str,
     # Otherwise: no target to replace (caller can decide to insert)
     return content, False
 
+
 def insert_block(content: str,
                  new_code: str,
                  target_name: Optional[str] = None,
                  lexical_chain: Optional[List[str]] = None) -> str:
     """
     Insert a function or class into content at the appropriate location.
+    For top-level insertions, places before any executable code like if __name__ == '__main__'.
 
     Args:
         content: Source code content
@@ -793,10 +795,21 @@ def insert_block(content: str,
     module = cst.parse_module(content)
 
     if not lexical_chain:
-        # Top-level insertion - append at end of module
-        new_module = module.with_changes(
-            body=list(module.body) + [node]
-        )
+        # Top-level insertion - find the right place before executable code
+        
+        # Find the insertion point before executable statements
+        insertion_index = len(module.body)  # Default to end
+        
+        for i, stmt in enumerate(module.body):
+            # Check if this statement is executable code that should come after declarations
+            if _is_executable_statement(stmt):
+                insertion_index = i
+                break
+        
+        # Insert at the found position
+        new_body = list(module.body)
+        new_body.insert(insertion_index, node)
+        new_module = module.with_changes(body=new_body)
     else:
         # Nested insertion - insert into specific container
         transformer = InsertIntoContainer(node, lexical_chain)
@@ -806,6 +819,55 @@ def insert_block(content: str,
             raise ValueError(f"Could not find container {'.'.join(lexical_chain)} for insertion")
 
     return new_module.code
+
+def _is_executable_statement(stmt: cst.BaseStatement) -> bool:
+    """
+    Check if a statement is executable code that should come after declarations.
+    Returns True for if __name__ == '__main__' blocks and other executable statements.
+    """
+    # Check for if __name__ == '__main__' pattern
+    if isinstance(stmt, cst.If):
+        test = stmt.test
+        if isinstance(test, cst.Comparison):
+            left = test.left
+            if (isinstance(left, cst.Name) and left.value == "__name__" and
+                len(test.comparisons) == 1):
+                comp = test.comparisons[0]
+                if (isinstance(comp.operator, cst.Equal) and
+                    isinstance(comp.comparator, cst.SimpleString) and
+                    comp.comparator.value in ("'__main__'", '"__main__"')):
+                    return True
+    
+    # Check for other executable statements at module level
+    if isinstance(stmt, cst.SimpleStatementLine):
+        for substmt in stmt.body:
+            # Function calls, bare expressions (not assignments)
+            if isinstance(substmt, cst.Expr):
+                return True
+            # Assignments to variables that look like execution
+            # (This is more heuristic - you might want to refine this)
+            if isinstance(substmt, cst.Assign):
+                # If the assignment involves a function call, it's executable
+                if _contains_function_call(substmt.value):
+                    return True
+    
+    # Other control flow that's typically executable
+    if isinstance(stmt, (cst.For, cst.While, cst.Try, cst.With)):
+        return True
+        
+    return False
+
+def _contains_function_call(node: cst.BaseExpression) -> bool:
+    """Check if an expression contains a function call."""
+    if isinstance(node, cst.Call):
+        return True
+    
+    # Recursively check compound expressions
+    if hasattr(node, 'left') and hasattr(node, 'right'):
+        return (_contains_function_call(node.left) if hasattr(node.left, 'left') or isinstance(node.left, cst.Call) else False) or \
+               (_contains_function_call(node.right) if hasattr(node.right, 'left') or isinstance(node.right, cst.Call) else False)
+    
+    return False
 
 def declare(file_path, target_path, new_code=None):
     """
