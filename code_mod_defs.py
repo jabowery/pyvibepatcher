@@ -68,6 +68,7 @@ class _DeletionTransformer(cst.CSTTransformer):
     - lexical_chain == ["A", "B"] => operate inside class A.B
     Deletes:
       * FunctionDef with matching name
+      * ClassDef with matching name
       * Assign to matching name (top-level or inside class scope)
     """
     def __init__(self, target_name: str, lexical_chain: List[str]):
@@ -107,15 +108,15 @@ class _DeletionTransformer(cst.CSTTransformer):
                 if isinstance(stmt, cst.FunctionDef) and stmt.name.value == self.target_name:
                     self.removed = True
                     continue
+                if isinstance(stmt, cst.ClassDef) and stmt.name.value == self.target_name:
+                    self.removed = True
+                    continue
                 if _is_assignment_to_name(stmt, self.target_name):
                     self.removed = True
                     continue
-                # We do NOT remove classes at module level by name here; deletion of a class
-                # itself can be supported similarly if needed.
                 new_body.append(stmt)
             updated_node = updated_node.with_changes(body=new_body)
         return updated_node
-
 
 def remove_block(source: str, target_name: str, lexical_chain: List[str]) -> Tuple[str, bool]:
     """
@@ -1149,6 +1150,17 @@ def create_file(file_path, file_content, make_executable=True):
     
     logging.debug(f"Created {'executable script' if make_executable else 'file'} {file_path}")
 
+
+#!/usr/bin/env python3
+"""
+Addition to code_mod_defs.py to support module_header modifications
+This adds the ability to modify the module header section of Python files
+"""
+
+import libcst as cst
+from typing import List, Optional, Tuple
+import re
+
 def module_header(file_path: str, header_content: str):
     """
     Replace or set the module header section of a Python file.
@@ -1321,26 +1333,6 @@ def _replace_header_with_raw_text(content: str, new_header: str, split_index: Op
     except Exception:
         # Complete fallback to text manipulation
         return _replace_header_regex_fallback(content, new_header)
-
-
-# Update the modification function resolver and parser to include module_header
-
-def _resolve_func_updated(name: str):
-    """Updated version of _resolve_func that includes module_header"""
-    table = {
-        "modification_description": modification_description,
-        "create_file": create_file,
-        "move_file": move_file,
-        "declare": declare,
-        "update_file": update_file,
-        "make_directory": make_directory,
-        "remove_file": remove_file,
-        "module_header": module_header,  # Add this line
-    }
-    if name not in table:
-        raise ValueError(f"Unknown modification function: {name}")
-    return table[name]
-
 
 # Example usage in modification file format:
 """

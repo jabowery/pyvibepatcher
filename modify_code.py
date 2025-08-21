@@ -53,9 +53,6 @@ def _split_sections(block_lines: List[str]) -> List[str]:
         if txt.endswith("\n"):
             txt = txt[:-1]
         out.append(txt)
-    # drop a trailing empty section introduced by a final separator
-    while out and out[-1] == "":
-        out.pop()
     return out
 
 def _resolve_func(name: str):
