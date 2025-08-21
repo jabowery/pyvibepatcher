@@ -37,6 +37,10 @@ declare(file_path, target_path [, new_code])
     target_path: Use dot notation for nested items (e.g., "ClassName.method_name")
     If the optional new_code is omitted, the declaration will be deleted.
 
+module_header(file_path, new_code)
+    Place new_code as the module header for file_path.
+    This critical section provides imports for the rest of the module.
+    
 Example Modification File
 
 MMM modification_description MMM

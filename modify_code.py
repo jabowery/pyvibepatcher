@@ -20,6 +20,7 @@ from code_mod_defs import (
     update_file,
     make_directory,
     remove_file,
+    module_header,
     # add others here as you introduce them
 )
 
@@ -67,6 +68,7 @@ def _resolve_func(name: str):
         "update_file": update_file,
         "make_directory": make_directory,
         "remove_file": remove_file,
+        "module_header": module_header,  # Add this line
     }
     if name not in table:
         raise ValueError(f"Unknown modification function: {name}")
@@ -167,6 +169,14 @@ def parse_modification_file(path: str):
             recursive = _parse_bool(sections[1]) if len(sections) >= 2 else False
             args = (path_arg,)
             kwargs = {"recursive": recursive}
+
+        elif fn is module_header:
+            if len(sections) < 2:
+                raise ValueError("module_header requires 2 sections: file_path, header_content.")
+            file_path_arg = sections[0].strip()
+            header_content_arg = sections[1]  # preserve newlines and formatting
+            args = (file_path_arg, header_content_arg)
+            kwargs = {}
 
         else:
             # Fallback: all sections as positional strings

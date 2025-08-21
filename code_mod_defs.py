@@ -11,7 +11,7 @@ import subprocess
 import datetime
 import json
 import libcst as cst
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
 
@@ -982,6 +982,8 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True, auto_co
     remove_file._rollback_manager = rollback_manager
     create_file._rollback_manager = rollback_manager
     modification_description._rollback_manager = rollback_manager
+    module_header._rollback_manager = rollback_manager
+
     # Register the newly added helpers:
     
     # Create rollback point - this will raise if it fails
@@ -990,7 +992,6 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True, auto_co
     # Process modifications and build commit message
     accumulated_descriptions = []
     other_modifications = []
-    
     for func, args, kwargs in modifications:
         if func == modification_description:
             accumulated_descriptions.append(args[0])
@@ -1052,6 +1053,8 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True, auto_co
             del create_file._rollback_manager
         if hasattr(modification_description, '_rollback_manager'):
             del modification_description._rollback_manager
+        if hasattr(module_header, '_rollback_manager'):
+            del module_header._rollback_manager
 
 # Interactive rollback interface
 def interactive_rollback():
@@ -1145,6 +1148,225 @@ def create_file(file_path, file_content, make_executable=True):
         create_file._rollback_manager.track_file(file_path)
     
     logging.debug(f"Created {'executable script' if make_executable else 'file'} {file_path}")
+
+def module_header(file_path: str, header_content: str):
+    """
+    Replace or set the module header section of a Python file.
+    The module header includes everything before the first class or function definition:
+    - Shebang line
+    - Encoding declarations  
+    - Module docstring
+    - Import statements
+    - Module-level constants and variables
+    - Any initial setup code that runs on import
+    
+    Args:
+        file_path: Path to the Python file to modify
+        header_content: New header content to replace existing header
+    """
+    # Track file for git operations
+    if hasattr(module_header, '_rollback_manager'):
+        module_header._rollback_manager.track_file(file_path)
+    
+    with open(file_path, 'r') as f:
+        content = f.read()
+    
+    new_content = replace_module_header(content, header_content)
+    
+    with open(file_path, 'w') as f:
+        f.write(new_content)
+
+
+def replace_module_header(content: str, new_header: str) -> str:
+    """
+    Replace the module header section with new content.
+    
+    Args:
+        content: Original Python file content
+        new_header: New header content to insert
+        
+    Returns:
+        Modified file content with new header
+    """
+    try:
+        module = cst.parse_module(content)
+    except Exception as e:
+        # If CST parsing fails, fall back to regex-based approach
+        return _replace_header_regex_fallback(content, new_header)
+    
+    # Find the first class or function definition
+    first_def_index = None
+    main_block_index = None
+    
+    for i, stmt in enumerate(module.body):
+        # Check for class or function definitions
+        if isinstance(stmt, (cst.FunctionDef, cst.ClassDef)):
+            if first_def_index is None:
+                first_def_index = i
+                break
+        
+        # Check for if __name__ == '__main__' block
+        if isinstance(stmt, cst.If) and _is_main_block(stmt):
+            if main_block_index is None:
+                main_block_index = i
+    
+    # Determine where to split: before first def/class, or before __main__ if no defs
+    split_index = first_def_index if first_def_index is not None else main_block_index
+    
+    # Extract shebang and encoding lines from new_header before CST parsing
+    new_header_lines = new_header.splitlines()
+    shebang_lines = []
+    parseable_lines = []
+    
+    for line in new_header_lines:
+        stripped = line.strip()
+        if (stripped.startswith('#!') or 
+            (stripped.startswith('#') and ('coding:' in stripped or 'coding=' in stripped))):
+            shebang_lines.append(line)
+        else:
+            parseable_lines.append(line)
+    
+    parseable_header = '\n'.join(parseable_lines)
+    
+    # Parse the parseable portion of new header
+    try:
+        if parseable_header.strip():
+            new_header_module = cst.parse_module(parseable_header)
+            new_header_stmts = new_header_module.body
+        else:
+            new_header_stmts = []
+    except Exception:
+        # If new header doesn't parse, treat as raw text and try to preserve structure
+        return _replace_header_with_raw_text(content, new_header, split_index)
+    
+    if split_index is None:
+        # No functions, classes, or __main__ block - replace entire file with header
+        result_code = cst.Module(body=new_header_stmts).code
+    else:
+        # Keep everything from split_index onwards, replace everything before
+        remaining_stmts = module.body[split_index:]
+        new_body = list(new_header_stmts) + list(remaining_stmts)
+        result_code = cst.Module(body=new_body).code
+    
+    # Prepend shebang and encoding lines if any
+    if shebang_lines:
+        shebang_text = '\n'.join(shebang_lines) + '\n'
+        result_code = shebang_text + result_code
+    
+    return result_code
+
+
+def _is_main_block(stmt: cst.If) -> bool:
+    """Check if an If statement is a __name__ == '__main__' block"""
+    test = stmt.test
+    if isinstance(test, cst.Comparison):
+        left = test.left
+        if (isinstance(left, cst.Name) and left.value == "__name__" and
+            len(test.comparisons) == 1):
+            comp = test.comparisons[0]
+            if (isinstance(comp.operator, cst.Equal) and
+                isinstance(comp.comparator, cst.SimpleString) and
+                comp.comparator.value in ("'__main__'", '"__main__"')):
+                return True
+    return False
+
+
+def _replace_header_regex_fallback(content: str, new_header: str) -> str:
+    """
+    Fallback method using regex when CST parsing fails.
+    This is less precise but handles malformed Python files.
+    """
+    lines = content.splitlines(keepends=True)
+    
+    # Find first function or class definition
+    first_def_line = None
+    main_block_line = None
+    
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        
+        # Look for function or class definitions at start of line (no indentation)
+        if re.match(r'^(def|class)\s+\w+', stripped):
+            if first_def_line is None:
+                first_def_line = i
+                break
+        
+        # Look for __main__ block
+        if re.match(r"^if\s+__name__\s*==\s*['\"]__main__['\"]", stripped):
+            if main_block_line is None:
+                main_block_line = i
+    
+    # Determine split point
+    split_line = first_def_line if first_def_line is not None else main_block_line
+    
+    if split_line is None:
+        # No functions, classes, or __main__ - replace entire file
+        return new_header
+    else:
+        # Replace header section, keep the rest
+        remaining_content = ''.join(lines[split_line:])
+        return new_header + remaining_content
+
+
+def _replace_header_with_raw_text(content: str, new_header: str, split_index: Optional[int]) -> str:
+    """Handle case where new_header doesn't parse as valid Python"""
+    if split_index is None:
+        return new_header
+    
+    try:
+        module = cst.parse_module(content)
+        remaining_stmts = module.body[split_index:]
+        remaining_code = cst.Module(body=remaining_stmts).code
+        return new_header + remaining_code
+    except Exception:
+        # Complete fallback to text manipulation
+        return _replace_header_regex_fallback(content, new_header)
+
+
+# Update the modification function resolver and parser to include module_header
+
+def _resolve_func_updated(name: str):
+    """Updated version of _resolve_func that includes module_header"""
+    table = {
+        "modification_description": modification_description,
+        "create_file": create_file,
+        "move_file": move_file,
+        "declare": declare,
+        "update_file": update_file,
+        "make_directory": make_directory,
+        "remove_file": remove_file,
+        "module_header": module_header,  # Add this line
+    }
+    if name not in table:
+        raise ValueError(f"Unknown modification function: {name}")
+    return table[name]
+
+
+# Example usage in modification file format:
+"""
+MMM module_header MMM
+path/to/file.py
+@@@@@@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+\"\"\"
+Updated module docstring explaining what this module does.
+\"\"\"
+
+import os
+import sys
+from pathlib import Path
+from typing import List, Dict, Optional
+
+# Updated module constants
+VERSION = "2.0.0"
+DEBUG = True
+CONFIG_PATH = "/etc/myapp/config.yaml"
+
+# Module initialization
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+"""
 
 # Example usage
 if __name__ == "__main__":
