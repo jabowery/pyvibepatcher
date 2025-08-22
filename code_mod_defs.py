@@ -1383,6 +1383,15 @@ def update_declaration(file_path, target_path, new_code=None):
     This is a convenience alias that provides clearer semantics for code updates.
     """
     return declare(file_path, target_path, new_code)
+def remove_declaration(file_path, target_path, new_code=None):
+    """
+    Alias for declare() function - removes a function, class, or assignment from a file.
+    If new_code is provided, replaces the declaration instead of removing it.
+    If new_code is None, the declaration is deleted.
+    
+    This is a convenience alias that provides clearer semantics for code removal.
+    """
+    return declare(file_path, target_path, new_code)
 
 # Example usage
 if __name__ == "__main__":

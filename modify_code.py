@@ -1,31 +1,16 @@
-#!/usr/bin/env python3
-"""
-Script to read and execute code modifications from a formatted file
-Usage: python modify_code.py <modification_file>
-"""
-import sys
-import re
-from code_mod_defs import *
-
-from pathlib import Path
-from typing import List, Tuple, Any
-import re
-
-# import the callables by name
 from code_mod_defs import (
     modification_description,
     create_file,
     move_file,
     declare,
     update_declaration,  # Add this line
+    remove_declaration,  # Add this line
     update_file,
     make_directory,
     remove_file,
     module_header,
     # add others here as you introduce them
 )
-
-_HEADER_RE = re.compile(r'^MMM\s+([A-Za-z_][A-Za-z0-9_]*)\s+MMM\s*')
 
 def _parse_bool(s: str) -> bool:
     s = s.strip().lower()
@@ -76,6 +61,7 @@ def _resolve_func(name: str):
         "move_file": move_file,
         "declare": declare,
         "update_declaration": declare,  # Add this line as synonym
+        "remove_declaration": declare,  # Add this line as synonym
         "update_file": update_file,
         "make_directory": make_directory,
         "remove_file": remove_file,
@@ -156,7 +142,7 @@ def parse_modification_file(path: str):
             args = (src, dst)
             kwargs = {}
 
-        elif fn is declare:  # This handles both 'declare' and 'update_declaration' since they resolve to the same function
+        elif fn is declare:  # This handles 'declare', 'update_declaration', and 'remove_declaration' since they resolve to the same function
             if len(sections) < 3:
                 raise ValueError(f"{func_name} requires 3 sections: file_path, name, content (or None for deletion).")
             file_path = sections[0].strip()
