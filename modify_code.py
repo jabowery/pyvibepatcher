@@ -1,3 +1,9 @@
+#!/bin/env python
+import sys
+from pathlib import Path
+from typing import List, Tuple, Any
+import re
+
 from code_mod_defs import (
     modification_description,
     create_file,
@@ -28,9 +34,11 @@ def _split_sections(block_lines: List[str]) -> List[str]:
     """
     sections: List[List[str]] = [[]]
     for ln in block_lines:
-        if ln.strip() == "@@@@@@":
+        if ln[:7] == "@@@@@@\n":
             sections.append([])
         else:
+            if ln[:7] == '\\@@@@@@':    # literal @@@@@@ must be escaped
+                ln = ln[1:]
             sections[-1].append(ln)
     out: List[str] = []
     for sec in sections:

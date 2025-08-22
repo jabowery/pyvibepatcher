@@ -38,11 +38,13 @@ declare(file_path, target_path [, new_code])
     If the optional new_code is omitted, the declaration will be deleted.
 
 update_declaration(file_path, target_path [, new_code])
-    This also updates declarations by simply callling declare as above.
+    The same as declare(file_path, target_path [, new_code])
+
+remove_declaration(file_path, target_path)
+    The same as declare(file_path, target_path)
 
 module_header(file_path, new_code)
-    Place new_code as the module header for file_path.
-    This critical section provides imports for the rest of the module.
+    new_code replaces the module header: all lines up to the first declaration (def or class).
     
 Example Modification File
 
