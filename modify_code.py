@@ -89,9 +89,9 @@ def parse_modification_file(path: str):
     Format:
         mmm <func_name> mmm
         <arg or payload...>
-        argstring
+        @@@@@
         <next arg...>
-        argstring
+        @@@@@
         ... (next block)
         mmm <func_name> mmm
         ...

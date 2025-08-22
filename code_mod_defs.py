@@ -885,7 +885,6 @@ def _contains_function_call(node: cst.BaseExpression) -> bool:
                (_contains_function_call(node.right) if hasattr(node.right, 'left') or isinstance(node.right, cst.Call) else False)
     
     return False
-
 def declare(file_path, target_path, new_code=None):
     """
     Declare a function, class, or assignment in a file with code using lexical chain support.
@@ -1375,6 +1374,15 @@ CONFIG_PATH = "/etc/myapp/config.yaml"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 """
+def update_declaration(file_path, target_path, new_code=None):
+    """
+    Alias for declare() function - updates a function, class, or assignment in a file.
+    If the target_path exists one or more times, replace all with the new declaration.
+    If new_code is None, the declaration is deleted.
+    
+    This is a convenience alias that provides clearer semantics for code updates.
+    """
+    return declare(file_path, target_path, new_code)
 
 # Example usage
 if __name__ == "__main__":
