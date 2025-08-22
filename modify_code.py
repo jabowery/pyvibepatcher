@@ -17,6 +17,7 @@ from code_mod_defs import (
     create_file,
     move_file,
     declare,
+    update_declaration,  # Add this line
     update_file,
     make_directory,
     remove_file,
@@ -24,7 +25,7 @@ from code_mod_defs import (
     # add others here as you introduce them
 )
 
-_HEADER_RE = re.compile(r'^\s*MMM\s+([A-Za-z_][A-Za-z0-9_]*)\s+MMM\s*$')
+_HEADER_RE = re.compile(r'^\s*MMM\s+([A-Za-z_][A-Za-z0-9_]*)\s+MMM\s*')
 
 def _parse_bool(s: str) -> bool:
     s = s.strip().lower()
@@ -55,6 +56,18 @@ def _split_sections(block_lines: List[str]) -> List[str]:
         out.append(txt)
     return out
 
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python modify_code.py <modification_file>")
+        sys.exit(1)
+    
+    modification_file = sys.argv[1]
+    
+    modifications = parse_modification_file(modification_file)
+    
+    manager = apply_modification_set(modifications)
+    print(f"\nModifications complete. Run 'python {sys.argv[0]} rollback' for rollback options.")
 def _resolve_func(name: str):
     # Extend this map as you add more supported operations
     table = {
@@ -62,25 +75,25 @@ def _resolve_func(name: str):
         "create_file": create_file,
         "move_file": move_file,
         "declare": declare,
+        "update_declaration": declare,  # Add this line as synonym
         "update_file": update_file,
         "make_directory": make_directory,
         "remove_file": remove_file,
-        "module_header": module_header,  # Add this line
+        "module_header": module_header,
     }
     if name not in table:
         raise ValueError(f"Unknown modification function: {name}")
     return table[name]
-
 def parse_modification_file(path: str):
     """
     Format:
-        MMM <func_name> MMM
+        mmm <func_name> mmm
         <arg or payload...>
-        @@@@@@
+        argstring
         <next arg...>
-        @@@@@@
+        argstring
         ... (next block)
-        MMM <func_name> MMM
+        mmm <func_name> mmm
         ...
     For known funcs we coerce argument types appropriately.
     Unknown funcs: treat all sections as positional strings.
@@ -143,9 +156,9 @@ def parse_modification_file(path: str):
             args = (src, dst)
             kwargs = {}
 
-        elif fn is declare:
+        elif fn is declare:  # This handles both 'declare' and 'update_declaration' since they resolve to the same function
             if len(sections) < 3:
-                raise ValueError("declare requires 3 sections: file_path, name, content (or None for deletion).")
+                raise ValueError(f"{func_name} requires 3 sections: file_path, name, content (or None for deletion).")
             file_path = sections[0].strip()
             name = sections[1].strip()
             content = sections[2] if sections[2].strip() else None  # treat empty content as None for deletion
@@ -186,19 +199,6 @@ def parse_modification_file(path: str):
         raise ValueError("No modification blocks found in file.")
 
     return entries
-
-
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: python modify_code.py <modification_file>")
-        sys.exit(1)
-    
-    modification_file = sys.argv[1]
-    
-    modifications = parse_modification_file(modification_file)
-    
-    manager = apply_modification_set(modifications)
-    print(f"\nModifications complete. Run 'python {sys.argv[0]} rollback' for rollback options.")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == 'rollback':
