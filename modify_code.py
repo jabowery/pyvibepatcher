@@ -25,7 +25,7 @@ from code_mod_defs import (
     # add others here as you introduce them
 )
 
-_HEADER_RE = re.compile(r'^\s*MMM\s+([A-Za-z_][A-Za-z0-9_]*)\s+MMM\s*')
+_HEADER_RE = re.compile(r'^MMM\s+([A-Za-z_][A-Za-z0-9_]*)\s+MMM\s*')
 
 def _parse_bool(s: str) -> bool:
     s = s.strip().lower()
