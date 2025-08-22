@@ -640,6 +640,11 @@ def replace_block(content: str,
     # Parse new_code
     mod = cst.parse_module(new_code)
     
+    # Initialize variables to avoid UnboundLocalError
+    replacement_node = None
+    inferred_kind = None
+    inferred_name = None
+    
     # Handle different cases based on content of new_code
     if len(mod.body) == 0:
         raise ValueError("new_code cannot be empty.")
@@ -677,6 +682,10 @@ def replace_block(content: str,
                             inferred_name = target.value
                         else:
                             raise ValueError("Annotated assignment malformed.")
+                else:
+                    logging.debug(f"content: {content}")
+                    logging.debug(f"new_code: {new_code}")
+                    raise ValueError("new_code must contain a function, class, or assignment definition.")
             else:
                 logging.debug(f"content: {content}")
                 logging.debug(f"new_code: {new_code}")
@@ -688,10 +697,6 @@ def replace_block(content: str,
     
     else:
         # Multiple statements - find the target def/class/assignment
-        replacement_node = None
-        inferred_kind = None
-        inferred_name = None
-        
         # If target_name is provided, look for it specifically
         if target_name:
             for node in mod.body:
@@ -842,15 +847,26 @@ def _is_executable_statement(stmt: cst.BaseStatement) -> bool:
     # Check for other executable statements at module level
     if isinstance(stmt, cst.SimpleStatementLine):
         for substmt in stmt.body:
-            # Function calls, bare expressions (not assignments)
-            if isinstance(substmt, cst.Expr):
+            # Skip module docstrings
+            if isinstance(substmt, cst.Expr) and isinstance(substmt.value, cst.SimpleString):
+                continue
+            # Skip common module setup function calls that are part of configuration
+            elif isinstance(substmt, cst.Expr) and isinstance(substmt.value, cst.Call):
+                if isinstance(substmt.value.func, cst.Attribute):
+                    # Allow common setup patterns like logging.basicConfig(), os.environ.update(), etc.
+                    attr_name = substmt.value.func.attr.value
+                    if attr_name in ("basicConfig", "getLogger", "configure", "setup", "init"):
+                        continue
+                # Skip bare function calls that look like setup
+                elif isinstance(substmt.value.func, cst.Name):
+                    func_name = substmt.value.func.value
+                    if func_name in ("setup", "configure", "init", "initialize"):
+                        continue
+                # Other function calls are considered executable
                 return True
-            # Assignments to variables that look like execution
-            # (This is more heuristic - you might want to refine this)
-            if isinstance(substmt, cst.Assign):
-                # If the assignment involves a function call, it's executable
-                if _contains_function_call(substmt.value):
-                    return True
+            # Other bare expressions (not assignments or setup calls) are executable
+            elif isinstance(substmt, cst.Expr):
+                return True
     
     # Other control flow that's typically executable
     if isinstance(stmt, (cst.For, cst.While, cst.Try, cst.With)):
