@@ -5,6 +5,7 @@ from typing import List, Tuple, Any
 import re
 
 from code_mod_defs import (
+    apply_modification_set,
     modification_description,
     create_file,
     move_file,
@@ -17,7 +18,7 @@ from code_mod_defs import (
     module_header,
     # add others here as you introduce them
 )
-
+_HEADER_RE = re.compile(r'^MMM\s+([A-Za-z_][A-Za-z0-9_]*)\s+MMM\s*')
 def _parse_bool(s: str) -> bool:
     s = s.strip().lower()
     if s in {"true", "1", "yes", "y"}:
@@ -151,11 +152,11 @@ def parse_modification_file(path: str):
             kwargs = {}
 
         elif fn is declare:  # This handles 'declare', 'update_declaration', and 'remove_declaration' since they resolve to the same function
-            if len(sections) < 3:
-                raise ValueError(f"{func_name} requires 3 sections: file_path, name, content (or None for deletion).")
+            if len(sections) < 2:
+                raise ValueError(f"{func_name} requires 2 sections: file_path, name, content (or None for deletion).")
             file_path = sections[0].strip()
             name = sections[1].strip()
-            content = sections[2] if sections[2].strip() else None  # treat empty content as None for deletion
+            content = sections[2] if len(sections)==3 and sections[2].strip() else None  # treat empty content as None for deletion
             args = (file_path, name, content)
             kwargs = {}
 

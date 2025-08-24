@@ -50,7 +50,7 @@ Example Modification File
 
 MMM modification_description MMM
 Fix file processing.
-(with was absent and potentially problematic under failures.)
+(was absent and potentially problematic under failures.)
 MMM declare MMM
 app.py
 @@@@@@
@@ -74,16 +74,13 @@ Empty for now though.
 MMM make_directory MMM
 tests/unit
 
-If something needs to be changed at the __main__ level other than a declaration, update the entire file.
-Use consistent file names so imports continue working
-Only change symbol names when function behavior changes
-Don't mask failures with try/except blocks or fallbacks unless requested
-Avoid superfluous modifiers like "improved", "optimized", "comprehensive"
+Only change symbol names when behavior changes
+Unless otherwise specified, provide tracebacks from except: blocks.
+In particular, avoid superfluous modifiers, e.g. "improved", "optimized", "comprehensive"
 Divide code into separate files for minimal context updates
-Create subdirectories according to best practices for separation of code, data and results.
-In creating subdirectories avoid circular imports!
+Create subdirectories according to best practices for separation of concerns, data and results.
 
-All code modification directives are to be presented as a single code block or downloadable file.
+Present modification directives in a single code block.
 
 When you have understood these standards reply with:
 
