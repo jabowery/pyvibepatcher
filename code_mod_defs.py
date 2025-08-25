@@ -998,7 +998,7 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True, auto_co
     remove_file._rollback_manager = rollback_manager
     create_file._rollback_manager = rollback_manager
     modification_description._rollback_manager = rollback_manager
-    module_header._rollback_manager = rollback_manager
+    update_header._rollback_manager = rollback_manager
 
     # Register the newly added helpers:
     
@@ -1069,8 +1069,8 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True, auto_co
             del create_file._rollback_manager
         if hasattr(modification_description, '_rollback_manager'):
             del modification_description._rollback_manager
-        if hasattr(module_header, '_rollback_manager'):
-            del module_header._rollback_manager
+        if hasattr(update_header, '_rollback_manager'):
+            del update_header._rollback_manager
 
 # Interactive rollback interface
 def interactive_rollback():
@@ -1168,7 +1168,7 @@ def create_file(file_path, file_content, make_executable=True):
 
 #!/usr/bin/env python3
 """
-Addition to code_mod_defs.py to support module_header modifications
+Addition to code_mod_defs.py to support update_header modifications
 This adds the ability to modify the module header section of Python files
 """
 
@@ -1176,7 +1176,7 @@ import libcst as cst
 from typing import List, Optional, Tuple
 import re
 
-def module_header(file_path: str, header_content: str):
+def update_header(file_path: str, header_content: str):
     """
     Replace or set the module header section of a Python file.
     The module header includes everything before the first class or function definition:
@@ -1192,19 +1192,19 @@ def module_header(file_path: str, header_content: str):
         header_content: New header content to replace existing header
     """
     # Track file for git operations
-    if hasattr(module_header, '_rollback_manager'):
-        module_header._rollback_manager.track_file(file_path)
+    if hasattr(update_header, '_rollback_manager'):
+        update_header._rollback_manager.track_file(file_path)
     
     with open(file_path, 'r') as f:
         content = f.read()
     
-    new_content = replace_module_header(content, header_content)
+    new_content = replace_update_header(content, header_content)
     
     with open(file_path, 'w') as f:
         f.write(new_content)
 
 
-def replace_module_header(content: str, new_header: str) -> str:
+def replace_update_header(content: str, new_header: str) -> str:
     """
     Replace the module header section with new content.
     
@@ -1351,7 +1351,7 @@ def _replace_header_with_raw_text(content: str, new_header: str, split_index: Op
 
 # Example usage in modification file format:
 """
-MMM module_header MMM
+MMM update_header MMM
 path/to/file.py
 @@@@@@
 #!/usr/bin/env python3

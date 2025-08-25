@@ -15,7 +15,7 @@ from code_mod_defs import (
     update_file,
     make_directory,
     remove_file,
-    module_header,
+    update_header,
     # add others here as you introduce them
 )
 _HEADER_RE = re.compile(r'^MMM\s+([A-Za-z_][A-Za-z0-9_]*)\s+MMM\s*')
@@ -74,7 +74,7 @@ def _resolve_func(name: str):
         "update_file": update_file,
         "make_directory": make_directory,
         "remove_file": remove_file,
-        "module_header": module_header,
+        "update_header": update_header,
     }
     if name not in table:
         raise ValueError(f"Unknown modification function: {name}")
@@ -175,9 +175,9 @@ def parse_modification_file(path: str):
             args = (path_arg,)
             kwargs = {"recursive": recursive}
 
-        elif fn is module_header:
+        elif fn is update_header:
             if len(sections) < 2:
-                raise ValueError("module_header requires 2 sections: file_path, header_content.")
+                raise ValueError("update_header requires 2 sections: file_path, header_content.")
             file_path_arg = sections[0].strip()
             header_content_arg = sections[1]  # preserve newlines and formatting
             args = (file_path_arg, header_content_arg)

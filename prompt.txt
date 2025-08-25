@@ -43,7 +43,7 @@ update_declaration(file_path, target_path [, new_code])
 remove_declaration(file_path, target_path)
     The same as declare(file_path, target_path)
 
-module_header(file_path, new_code)
+update_header(file_path, new_code)
     new_code replaces the module header: all lines up to the first declaration (def or class).
     
 Example Modification File
