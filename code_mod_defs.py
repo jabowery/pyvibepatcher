@@ -1022,7 +1022,7 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True, auto_co
     try:
         # Apply all non-description modifications
         for func, args, kwargs in other_modifications:
-            print(func)
+            print(func.__name__)
             func(*args, **kwargs)
         
         # Determine if we should commit
