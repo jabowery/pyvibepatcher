@@ -74,6 +74,10 @@ Empty for now though.
 MMM make_directory MMM
 tests/unit
 
+Note that in no case is there an empty argument, ie: There is no @@@@@@ that is not followed by an argument.
+
+Put these directives in a text segment that i can copy so it doesn't render as markup.
+
 Only change symbol names when behavior changes
 Unless otherwise specified, provide tracebacks from except: blocks.
 In particular, avoid superfluous modifiers, e.g. "improved", "optimized", "comprehensive"
