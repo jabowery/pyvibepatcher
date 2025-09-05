@@ -1,6 +1,6 @@
 # TLDR
 
-See [prompt.txt](prompt.txt)
+See [prompt.txt](prompt.txt) that prompts the LLM coding assistant to provide modification directives.
 
 Given a modification directives file named "fixes.txt":
 
