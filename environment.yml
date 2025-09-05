@@ -1,4 +1,4 @@
-name: pycoder
+name: pyvibepatcher
 channels:
   - conda-forge
   - defaults
