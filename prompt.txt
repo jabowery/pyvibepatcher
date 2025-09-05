@@ -76,7 +76,7 @@ tests/unit
 
 Note that in no case is there an empty argument, ie: There is no @@@@@@ that is not followed by an argument.
 
-Put these directives in a text segment that i can copy so it doesn't render as markup.
+Provide these directdives in a downloadable file so it doesn't render as markup in the chat panel.
 
 Only change symbol names when behavior changes
 Unless otherwise specified, provide tracebacks from except: blocks.
