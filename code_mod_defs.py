@@ -1362,12 +1362,11 @@ def declare(file_path, target_path, new_code=None):
       - If *new_code* is None, delete the target declaration (previous behavior).
 
     Notes:
-      * This splitter is intentionally simple and relies on blank-line separation
-        between declarations. It recognizes:
-          - function defs:  "def NAME(...):" or "async def NAME(...):"
-          - class defs:     "class NAME(...):" (or without bases)
-          - assignments:    "NAME = ..." (top-level or within a class chain)
+      * Uses AST parsing to properly identify top-level declarations, avoiding
+        issues with blank lines within function bodies or complex decorators.
     """
+    import ast
+    
     logging.debug(f'file: {file_path}')
 
     # Track file for git operations BEFORE modifying it
@@ -1390,43 +1389,122 @@ def declare(file_path, target_path, new_code=None):
             f.write(new_content)
         return
 
-    # Helper: split *new_code* into one or more declarations and infer their names.
-    # We keep the splitter conservative and whitespace-tolerant.
-    def _split_declarations(src: str):
-        # Normalize line endings and trim outer whitespace
-        src = src.strip('\n')
-        if not src:
+    # Helper: Use AST to properly identify top-level declarations
+    def _extract_declarations_ast(src: str):
+        """Extract top-level declarations using AST parsing."""
+        try:
+            tree = ast.parse(src)
+        except SyntaxError as e:
+            logging.warning(f"declare(): Could not parse new_code as valid Python: {e}")
             return []
-
-        # Split on 2+ newlines as a declaration boundary
-        chunks = [c.strip('\n') for c in re.split(r"\n{2,}", src) if c.strip()]
-        decls = []  # list[(name, code)]
-        for chunk in chunks:
-            # Identify declaration name
-            m = re.match(r"^\s*async\s+def\s+([A-Za-z_]\w*)\s*\(", chunk)
-            if not m:
-                m = re.match(r"^\s*def\s+([A-Za-z_]\w*)\s*\(", chunk)
-            if not m:
-                m = re.match(r"^\s*class\s+([A-Za-z_]\w*)\b", chunk)
-            if not m:
-                m = re.match(r"^\s*([A-Za-z_]\w*)\s*=\s*", chunk)  # assignment
-            if not m:
-                # Unrecognized chunk; skip it rather than failing hard
-                logging.warning("declare(): could not infer name for a code chunk; skipping it.")
+        
+        decls = []  # list[(name, start_line, end_line)]
+        
+        for node in ast.walk(tree):
+            # Only consider top-level nodes (those directly under Module)
+            if not isinstance(getattr(node, 'parent', None), (type(None), ast.Module)):
                 continue
+                
+            name = None
+            if isinstance(node, ast.FunctionDef):
+                name = node.name
+            elif isinstance(node, ast.AsyncFunctionDef):
+                name = node.name  
+            elif isinstance(node, ast.ClassDef):
+                name = node.name
+            elif isinstance(node, ast.Assign):
+                # Handle simple assignments like "x = value"
+                if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                    name = node.targets[0].id
+            elif isinstance(node, ast.AnnAssign):
+                # Handle annotated assignments like "x: int = value"
+                if isinstance(node.target, ast.Name):
+                    name = node.target.id
+            
+            if name and hasattr(node, 'lineno') and hasattr(node, 'end_lineno'):
+                decls.append((name, node.lineno, node.end_lineno or node.lineno))
+        
+        # Sort by line number and extract code text for each declaration
+        decls.sort(key=lambda x: x[1])
+        lines = src.splitlines()
+        
+        result = []
+        for name, start_line, end_line in decls:
+            # Convert to 0-based indexing
+            start_idx = start_line - 1
+            end_idx = end_line  # end_lineno is inclusive, so we don't subtract 1
+            
+            if start_idx >= 0 and end_idx <= len(lines):
+                code_lines = lines[start_idx:end_idx]
+                code_text = '\n'.join(code_lines)
+                if not code_text.endswith('\n'):
+                    code_text += '\n'
+                result.append((name, code_text))
+        
+        return result
 
-            nm = m.group(1)
-            # Ensure trailing newline for insertion consistency
-            code_text = chunk
-            if not code_text.endswith('\n'):
-                code_text += '\n'
-            decls.append((nm, code_text))
-        return decls
+    # Add parent references to AST nodes for top-level detection
+    def _add_parent_refs(node, parent=None):
+        node.parent = parent
+        for child in ast.iter_child_nodes(node):
+            _add_parent_refs(child, node)
 
-    decls = _split_declarations(new_code)
+    # Modified extraction that properly sets parent references
+    def _extract_declarations_with_parents(src: str):
+        try:
+            tree = ast.parse(src)
+            _add_parent_refs(tree)
+        except SyntaxError as e:
+            logging.warning(f"declare(): Could not parse new_code as valid Python: {e}")
+            return []
+        
+        decls = []
+        
+        # Only look at direct children of the module
+        for node in tree.body:
+            name = None
+            start_line = node.lineno
+            
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = node.name
+                # Include decorators in the start line
+                if node.decorator_list:
+                    start_line = node.decorator_list[0].lineno
+            elif isinstance(node, ast.ClassDef):
+                name = node.name
+                # Include decorators in the start line  
+                if node.decorator_list:
+                    start_line = node.decorator_list[0].lineno
+            elif isinstance(node, ast.Assign):
+                if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                    name = node.targets[0].id
+            elif isinstance(node, ast.AnnAssign):
+                if isinstance(node.target, ast.Name):
+                    name = node.target.id
+            
+            if name and hasattr(node, 'end_lineno'):
+                end_line = node.end_lineno or node.lineno
+                decls.append((name, start_line, end_line))
+        
+        # Extract code text for each declaration
+        lines = src.splitlines()
+        result = []
+        for name, start_line, end_line in decls:
+            start_idx = start_line - 1
+            end_idx = end_line
+            
+            if start_idx >= 0 and end_idx <= len(lines):
+                code_lines = lines[start_idx:end_idx]
+                code_text = '\n'.join(code_lines)
+                if not code_text.endswith('\n'):
+                    code_text += '\n'
+                result.append((name, code_text))
+        
+        return result
 
-    # If we only found one declaration (or splitter couldn't detect multiple),
-    # fall back to the original single-target behavior.
+    decls = _extract_declarations_with_parents(new_code)
+
+    # If we only found one declaration, fall back to the original single-target behavior
     if len(decls) <= 1:
         # ----- REPLACE or INSERT -----
         # Force fallback for assignments since replace_block is broken for them
@@ -1450,7 +1528,6 @@ def declare(file_path, target_path, new_code=None):
 
     # Multi-declaration path:
     # Apply first declaration to the explicit target; additional ones share the same chain.
-    # We update *content* incrementally so later inserts see prior changes.
     new_content = content
 
     # First declaration: prefer the code whose inferred name matches target_name;
