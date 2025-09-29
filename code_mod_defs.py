@@ -929,106 +929,6 @@ def modification_description(description_text):
     if hasattr(modification_description, '_rollback_manager'):
         modification_description._rollback_manager.accumulate_message(description_text)
     
-    logging.debug(f"Added modification description: {description_text}")
-
-def apply_modification_set(modifications, auto_rollback_on_failure=True, auto_commit=None, commit_message=None):
-    """
-    Apply a set of modifications with rollback support
-    
-    Args:
-        modifications: List of (function, args, kwargs) tuples
-        auto_rollback_on_failure: If True, automatically rollback on any failure
-        auto_commit: If True, force commit even if no files tracked. If None, use existing logic.
-        commit_message: Override commit message. If None, use accumulated descriptions.
-        
-    Returns:
-        GitRollbackManager: Manager instance for manual rollback operations
-        
-    Raises:
-        RuntimeError: If rollback capability cannot be established
-    """
-    rollback_manager = GitRollbackManager()
-    
-    # Set rollback manager on modification functions
-    declare._rollback_manager = rollback_manager
-    move_file._rollback_manager = rollback_manager
-    remove_file._rollback_manager = rollback_manager
-    create_file._rollback_manager = rollback_manager
-    modification_description._rollback_manager = rollback_manager
-    update_header._rollback_manager = rollback_manager
-
-    # Register the newly added helpers:
-    
-    # Create rollback point - this will raise if it fails
-    rollback_info = rollback_manager.create_rollback_point("Before LLM modifications")
-    
-    # Process modifications and build commit message
-    accumulated_descriptions = []
-    other_modifications = []
-    for func, args, kwargs in modifications:
-        if func == modification_description:
-            accumulated_descriptions.append(args[0])
-        else:
-            other_modifications.append((func, args, kwargs))
-    
-    # Set accumulated message from all descriptions
-    if accumulated_descriptions:
-        full_description = "\n".join(accumulated_descriptions)
-        rollback_manager.accumulate_message(full_description)
-    
-    try:
-        # Apply all non-description modifications
-        for func, args, kwargs in other_modifications:
-            print(func.__name__)
-            func(*args, **kwargs)
-        
-        # Determine if we should commit
-        should_commit = False
-        if auto_commit is True:
-            should_commit = True
-        elif auto_commit is None and rollback_manager.tracked_files:
-            should_commit = True
-        
-        # Create final commit if needed
-        if should_commit:
-            final_commit_message = commit_message
-            if not final_commit_message:
-                final_commit_message = rollback_manager.get_accumulated_message()
-            if not final_commit_message:
-                final_commit_message = "After LLM modifications"
-            
-            rollback_manager.create_rollback_point(final_commit_message, force_commit=True)
-        
-        logging.info("All modifications completed successfully")
-        rollback_manager.show_rollback_options()
-        return rollback_manager
-        
-    except Exception as e:
-        logging.error(f"Modifications failed: {e}")
-        
-        if auto_rollback_on_failure:
-            logging.info("Auto-rolling back due to failure...")
-            rollback_manager.hard_rollback()
-        else:
-            logging.info("Manual rollback available - use returned manager")
-            rollback_manager.show_rollback_options()
-        
-        raise
-    finally:
-        # Clean up rollback manager references
-        if hasattr(declare, '_rollback_manager'):
-            del declare._rollback_manager
-        if hasattr(move_file, '_rollback_manager'):
-            del move_file._rollback_manager
-        if hasattr(remove_file, '_rollback_manager'):
-            del remove_file._rollback_manager
-        if hasattr(create_file, '_rollback_manager'):
-            del create_file._rollback_manager
-        if hasattr(modification_description, '_rollback_manager'):
-            del modification_description._rollback_manager
-        if hasattr(update_header, '_rollback_manager'):
-            del update_header._rollback_manager
-
 # Interactive rollback interface
 def interactive_rollback():
     """Interactive interface for rollback operations"""
@@ -1349,24 +1249,178 @@ def remove_declaration(file_path, target_path, new_code=None):
     This is a convenience alias that provides clearer semantics for code removal.
     """
     return declare(file_path, target_path, new_code)
+
+def apply_modification_set(modifications, auto_rollback_on_failure=True, auto_commit=None, commit_message=None):
+    """
+    Apply a set of modifications with rollback support
+    
+    Args:
+        modifications: List of (function, args, kwargs) tuples
+        auto_rollback_on_failure: If True, automatically rollback on any failure
+        auto_commit: If True, force commit even if no files tracked. If None, use existing logic.
+        commit_message: Override commit message. If None, use accumulated descriptions.
+        
+    Returns:
+        GitRollbackManager: Manager instance for manual rollback operations
+        
+    Raises:
+        RuntimeError: If rollback capability cannot be established
+    """
+    rollback_manager = GitRollbackManager()
+    
+    # Set rollback manager on modification functions
+    declare._rollback_manager = rollback_manager
+    move_file._rollback_manager = rollback_manager
+    remove_file._rollback_manager = rollback_manager
+    create_file._rollback_manager = rollback_manager
+    modification_description._rollback_manager = rollback_manager
+    update_header._rollback_manager = rollback_manager
+
+    # Create rollback point - this will raise if it fails
+    rollback_info = rollback_manager.create_rollback_point("Before LLM modifications")
+    
+    # Process modifications and build commit message
+    accumulated_descriptions = []
+    other_modifications = []
+    for func, args, kwargs in modifications:
+        if func == modification_description:
+            accumulated_descriptions.append(args[0])
+        else:
+            other_modifications.append((func, args, kwargs))
+    
+    # Set accumulated message from all descriptions
+    if accumulated_descriptions:
+        full_description = "\n".join(accumulated_descriptions)
+        rollback_manager.accumulate_message(full_description)
+    
+    try:
+        # Apply all non-description modifications
+        for func, args, kwargs in other_modifications:
+            print(func.__name__)
+            func(*args, **kwargs)
+        
+        # Determine if we should commit
+        should_commit = False
+        if auto_commit is True:
+            should_commit = True
+        elif auto_commit is None and rollback_manager.tracked_files:
+            should_commit = True
+        
+        # Create final commit if needed
+        if should_commit:
+            final_commit_message = commit_message
+            if not final_commit_message:
+                final_commit_message = rollback_manager.get_accumulated_message()
+            if not final_commit_message:
+                final_commit_message = "After LLM modifications"
+            
+            rollback_manager.create_rollback_point(final_commit_message, force_commit=True)
+        
+        logging.info("All modifications completed successfully")
+        rollback_manager.show_rollback_options()
+        return rollback_manager
+        
+    except Exception as e:
+        logging.error(f"Modifications failed: {e}")
+        
+        if auto_rollback_on_failure:
+            logging.info("Auto-rolling back due to failure...")
+            success = rollback_manager.hard_rollback()
+            if success:
+                logging.info("Rollback completed successfully")
+            else:
+                logging.error("Rollback failed - manual intervention may be required")
+        else:
+            logging.info("Manual rollback available - use returned manager")
+            rollback_manager.show_rollback_options()
+        
+        raise
+    finally:
+        # Clean up rollback manager references
+        if hasattr(declare, '_rollback_manager'):
+            del declare._rollback_manager
+        if hasattr(move_file, '_rollback_manager'):
+            del move_file._rollback_manager
+        if hasattr(remove_file, '_rollback_manager'):
+            del remove_file._rollback_manager
+        if hasattr(create_file, '_rollback_manager'):
+            del create_file._rollback_manager
+        if hasattr(modification_description, '_rollback_manager'):
+            del modification_description._rollback_manager
+        if hasattr(update_header, '_rollback_manager'):
+            del update_header._rollback_manager
+
+
 def declare(file_path, target_path, new_code=None):
     """
     Declare a function, class, or assignment in a file with code using lexical chain support.
 
     Extensions:
-      - If *new_code* contains multiple declarations (e.g., multiple top-level "def"/"class"
-        blocks or assignments separated by blank lines), then:
-          * the first declaration applies to *target_path* as usual
-          * each additional declaration is applied at the same lexical base path
-            as the first (i.e., same class chain), with its own inferred name.
-      - If *new_code* is None, delete the target declaration (previous behavior).
+      - If target_path looks like Python code (contains 'def', 'class', or '='), it's treated
+        as the declaration itself, and the target name is automatically extracted.
+      - If new_code contains multiple declarations, the first declaration applies to target_path
+        and each additional declaration is applied at the same lexical base path.
+      - If new_code is None, delete the target declaration.
 
-    Notes:
-      * Uses AST parsing to properly identify top-level declarations, avoiding
-        issues with blank lines within function bodies or complex decorators.
+    Args:
+        file_path: Path to the file to modify
+        target_path: Either a dotted path like "ClassName.method" OR the actual code to insert
+        new_code: The code to insert (optional if target_path contains the code)
     """
     import ast
     
+    # Check if file_path contains .py followed by more path components
+    # This handles cases like "heteromix_training.py.add_artifact_cli_args"
+    if '.py.' in file_path:
+        py_index = file_path.index('.py.')
+        actual_file_path = file_path[:py_index + 3]  # Include the '.py'
+        remaining_path = file_path[py_index + 4:]  # Everything after '.py.'
+        
+        # If we're in 2-arg form (target_path is code), use remaining_path as target
+        if target_path and any(kw in target_path for kw in ['def ', 'class ', '= ', 'async def ']):
+            new_code = target_path
+            target_path = remaining_path
+            file_path = actual_file_path
+            logging.info(f"Extracted filepath '{file_path}' and target '{target_path}' from combined path")
+        else:
+            # 3-arg form: shift everything
+            new_code = new_code
+            target_path = remaining_path
+            file_path = actual_file_path
+            logging.info(f"Extracted filepath '{file_path}' and target '{target_path}' from combined path")
+    
+    # Auto-detect if target_path is actually the code declaration
+    if new_code is None and target_path and any(kw in target_path for kw in ['def ', 'class ', '= ', 'async def ']):
+        # User passed the declaration as second argument
+        new_code = target_path
+        
+        # Extract the target name from the code
+        try:
+            tree = ast.parse(new_code)
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    target_path = node.name
+                    logging.info(f"Auto-detected target name '{target_path}' from declaration")
+                    break
+                elif isinstance(node, ast.Assign):
+                    if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                        target_path = node.targets[0].id
+                        logging.info(f"Auto-detected target name '{target_path}' from assignment")
+                        break
+                elif isinstance(node, ast.AnnAssign):
+                    if isinstance(node.target, ast.Name):
+                        target_path = node.target.id
+                        logging.info(f"Auto-detected target name '{target_path}' from annotated assignment")
+                        break
+            else:
+                raise ValueError("Could not extract target name from declaration")
+        except (SyntaxError, ValueError) as e:
+            raise ValueError(
+                f"Second argument appears to be code but could not parse target name: {e}\n"
+                f"Either provide valid Python code or use the format: declare(file, 'target_name', code)"
+            )
+    
+    # ... rest of the function remains the same    
     logging.debug(f'file: {file_path}')
 
     # Track file for git operations BEFORE modifying it
@@ -1382,74 +1436,22 @@ def declare(file_path, target_path, new_code=None):
     if new_code is None:
         new_content, removed = remove_block(content, target_name, lexical_chain)
         if not removed:
-            logging.error(
-                f"Error removing {target_name}: target not found at chain {'.'.join(lexical_chain) or '<module>'}"
+            error_msg = (
+                f"Error removing '{target_name}': target not found at chain "
+                f"{'.'.join(lexical_chain) or '<module>'}"
             )
+            logging.error(error_msg)
+            raise ValueError(error_msg)
         with open(file_path, 'w') as f:
             f.write(new_content)
         return
 
     # Helper: Use AST to properly identify top-level declarations
-    def _extract_declarations_ast(src: str):
-        """Extract top-level declarations using AST parsing."""
-        try:
-            tree = ast.parse(src)
-        except SyntaxError as e:
-            logging.warning(f"declare(): Could not parse new_code as valid Python: {e}")
-            return []
-        
-        decls = []  # list[(name, start_line, end_line)]
-        
-        for node in ast.walk(tree):
-            # Only consider top-level nodes (those directly under Module)
-            if not isinstance(getattr(node, 'parent', None), (type(None), ast.Module)):
-                continue
-                
-            name = None
-            if isinstance(node, ast.FunctionDef):
-                name = node.name
-            elif isinstance(node, ast.AsyncFunctionDef):
-                name = node.name  
-            elif isinstance(node, ast.ClassDef):
-                name = node.name
-            elif isinstance(node, ast.Assign):
-                # Handle simple assignments like "x = value"
-                if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                    name = node.targets[0].id
-            elif isinstance(node, ast.AnnAssign):
-                # Handle annotated assignments like "x: int = value"
-                if isinstance(node.target, ast.Name):
-                    name = node.target.id
-            
-            if name and hasattr(node, 'lineno') and hasattr(node, 'end_lineno'):
-                decls.append((name, node.lineno, node.end_lineno or node.lineno))
-        
-        # Sort by line number and extract code text for each declaration
-        decls.sort(key=lambda x: x[1])
-        lines = src.splitlines()
-        
-        result = []
-        for name, start_line, end_line in decls:
-            # Convert to 0-based indexing
-            start_idx = start_line - 1
-            end_idx = end_line  # end_lineno is inclusive, so we don't subtract 1
-            
-            if start_idx >= 0 and end_idx <= len(lines):
-                code_lines = lines[start_idx:end_idx]
-                code_text = '\n'.join(code_lines)
-                if not code_text.endswith('\n'):
-                    code_text += '\n'
-                result.append((name, code_text))
-        
-        return result
-
-    # Add parent references to AST nodes for top-level detection
     def _add_parent_refs(node, parent=None):
         node.parent = parent
         for child in ast.iter_child_nodes(node):
             _add_parent_refs(child, node)
 
-    # Modified extraction that properly sets parent references
     def _extract_declarations_with_parents(src: str):
         try:
             tree = ast.parse(src)
@@ -1506,7 +1508,6 @@ def declare(file_path, target_path, new_code=None):
 
     # If we only found one declaration, fall back to the original single-target behavior
     if len(decls) <= 1:
-        # ----- REPLACE or INSERT -----
         # Force fallback for assignments since replace_block is broken for them
         if target_name in content and '=' in new_code:
             new_content, removed = remove_block(content, target_name, lexical_chain)
@@ -1526,12 +1527,10 @@ def declare(file_path, target_path, new_code=None):
             f.write(new_content)
         return
 
-    # Multi-declaration path:
-    # Apply first declaration to the explicit target; additional ones share the same chain.
+    # Multi-declaration path
     new_content = content
 
-    # First declaration: prefer the code whose inferred name matches target_name;
-    # otherwise, take decls[0] but log a warning if names differ.
+    # First declaration: prefer the code whose inferred name matches target_name
     first_idx = 0
     for i, (nm, _) in enumerate(decls):
         if nm == target_name:
@@ -1559,13 +1558,14 @@ def declare(file_path, target_path, new_code=None):
                 c2 = insert_block(curr_content, code_text, target_name=nm, lexical_chain=lexical_chain)
             return c2
 
-    # Apply the first, then the rest (sharing the same lexical_chain)
+    # Apply the first, then the rest
     new_content = _apply_one(new_content, first_decl[0], first_decl[1])
     for nm, code_text in rest_decls:
         new_content = _apply_one(new_content, nm, code_text)
 
     with open(file_path, 'w') as f:
         f.write(new_content)
+
 
 # Example usage
 if __name__ == "__main__":
