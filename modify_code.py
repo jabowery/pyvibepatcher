@@ -156,7 +156,7 @@ def parse_modification_file(path: str):
                 raise ValueError(f"{func_name} requires 2 sections: file_path, name, content (or None for deletion).")
             file_path = sections[0].strip()
             name = sections[1].strip()
-            content = sections[2] if len(sections)==3 and sections[2].strip() else None  # treat empty content as None for deletion
+            content = sections[2] if len(sections) == 3 else None
             args = (file_path, name, content)
             kwargs = {}
 
