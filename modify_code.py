@@ -74,6 +74,7 @@ def _resolve_func(name: str):
         "update_file": update_file,
         "make_directory": make_directory,
         "remove_file": remove_file,
+        "delete_file": remove_file,
         "update_header": update_header,
     }
     if name not in table:
