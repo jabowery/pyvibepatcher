@@ -73,9 +73,9 @@ Empty for now though.
 MMM make_directory MMM
 tests/unit
 
-Note that in no case is there an empty argument, ie: There is no @@@@@@ that is not followed by an argument.
-
 Provide these directives in a code section of the chat panel.
+
+If a function is getting too long, and it becomes tempting to violate compliance by replacing only a part of it, choose instead to refactor it into subfunctions and then update the relevant subfunction.
 
 Only change symbol names when behavior changes
 Unless otherwise specified, provide tracebacks from except: blocks.
