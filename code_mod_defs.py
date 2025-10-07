@@ -12,12 +12,12 @@ import datetime
 import json
 import libcst as cst
 from typing import Optional, List, Tuple
+import ast
 
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
 
-import libcst as cst
-from typing import Tuple, List
-
+import stat
+import textwrap
 
 # near other LibCST helpers
 def _target_exists(source: str, target_name: str, chain: list[str]) -> bool:
@@ -543,8 +543,6 @@ def parse_lexical_chain(target_path: str) -> tuple[str, List[str]]:
     
     return parts[-1], parts[:-1]
 
-import libcst as cst
-from typing import List, Optional
 
 class ReplaceDeclaration(cst.CSTTransformer):
     """
@@ -1005,7 +1003,6 @@ def create_file(file_path, file_content, make_executable=True):
         file_content: Content of the script
         make_executable: If True, set executable permissions (Unix/Linux/Mac)
     """
-    import stat
     
     #with open(file_path, 'w') as f:
     with open_with_mkdir(file_path, 'w') as f:
@@ -1023,15 +1020,11 @@ def create_file(file_path, file_content, make_executable=True):
     logging.debug(f"Created {'executable script' if make_executable else 'file'} {file_path}")
 
 
-#!/usr/bin/env python3
 """
 Addition to code_mod_defs.py to support update_header modifications
 This adds the ability to modify the module header section of Python files
 """
 
-import libcst as cst
-from typing import List, Optional, Tuple
-import re
 
 def update_header(file_path: str, header_content: str):
     """
@@ -1350,6 +1343,63 @@ def apply_modification_set(modifications, auto_rollback_on_failure=True, auto_co
         if hasattr(update_header, '_rollback_manager'):
             del update_header._rollback_manager
 
+# Helper: Use AST to properly identify top-level declarations
+def _add_parent_refs(node, parent=None):
+    node.parent = parent
+    for child in ast.iter_child_nodes(node):
+        _add_parent_refs(child, node)
+
+def _extract_declarations_with_parents(src: str):
+    try:
+        tree = ast.parse(src)
+        _add_parent_refs(tree)
+    except SyntaxError as e:
+        logging.warning(f"declare(): Could not parse new_code as valid Python: {e}")
+        return []
+    
+    decls = []
+    
+    # Only look at direct children of the module
+    for node in tree.body:
+        name = None
+        start_line = node.lineno
+        
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = node.name
+            # Include decorators in the start line
+            if node.decorator_list:
+                start_line = node.decorator_list[0].lineno
+        elif isinstance(node, ast.ClassDef):
+            name = node.name
+            # Include decorators in the start line  
+            if node.decorator_list:
+                start_line = node.decorator_list[0].lineno
+        elif isinstance(node, ast.Assign):
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                name = node.targets[0].id
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                name = node.target.id
+        
+        if name and hasattr(node, 'end_lineno'):
+            end_line = node.end_lineno or node.lineno
+            decls.append((name, start_line, end_line))
+    
+    # Extract code text for each declaration
+    lines = src.splitlines()
+    result = []
+    for name, start_line, end_line in decls:
+        start_idx = start_line - 1
+        end_idx = end_line
+        
+        if start_idx >= 0 and end_idx <= len(lines):
+            code_lines = lines[start_idx:end_idx]
+            code_text = '\n'.join(code_lines)
+            if not code_text.endswith('\n'):
+                code_text += '\n'
+            result.append((name, code_text))
+    
+    return result
 
 def declare(file_path, target_path, new_code=None):
     """
@@ -1369,8 +1419,6 @@ def declare(file_path, target_path, new_code=None):
         target_path: Either a dotted path like "ClassName.method" OR the actual code to insert
         new_code: The code to insert (optional if target_path contains the code)
     """
-    import ast
-    import textwrap
     
     # Check if file_path contains .py followed by more path components
     # This handles cases like "heteromix_training.py.add_artifact_cli_args"
@@ -1456,63 +1504,6 @@ def declare(file_path, target_path, new_code=None):
             f.write(new_content)
         return
 
-    # Helper: Use AST to properly identify top-level declarations
-    def _add_parent_refs(node, parent=None):
-        node.parent = parent
-        for child in ast.iter_child_nodes(node):
-            _add_parent_refs(child, node)
-
-    def _extract_declarations_with_parents(src: str):
-        try:
-            tree = ast.parse(src)
-            _add_parent_refs(tree)
-        except SyntaxError as e:
-            logging.warning(f"declare(): Could not parse new_code as valid Python: {e}")
-            return []
-        
-        decls = []
-        
-        # Only look at direct children of the module
-        for node in tree.body:
-            name = None
-            start_line = node.lineno
-            
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                name = node.name
-                # Include decorators in the start line
-                if node.decorator_list:
-                    start_line = node.decorator_list[0].lineno
-            elif isinstance(node, ast.ClassDef):
-                name = node.name
-                # Include decorators in the start line  
-                if node.decorator_list:
-                    start_line = node.decorator_list[0].lineno
-            elif isinstance(node, ast.Assign):
-                if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                    name = node.targets[0].id
-            elif isinstance(node, ast.AnnAssign):
-                if isinstance(node.target, ast.Name):
-                    name = node.target.id
-            
-            if name and hasattr(node, 'end_lineno'):
-                end_line = node.end_lineno or node.lineno
-                decls.append((name, start_line, end_line))
-        
-        # Extract code text for each declaration
-        lines = src.splitlines()
-        result = []
-        for name, start_line, end_line in decls:
-            start_idx = start_line - 1
-            end_idx = end_line
-            
-            if start_idx >= 0 and end_idx <= len(lines):
-                code_lines = lines[start_idx:end_idx]
-                code_text = '\n'.join(code_lines)
-                if not code_text.endswith('\n'):
-                    code_text += '\n'
-                result.append((name, code_text))
-        
-        return result
 
     decls = _extract_declarations_with_parents(new_code)
 
