@@ -1361,6 +1361,8 @@ def declare(file_path, target_path, new_code=None):
       - If new_code contains multiple declarations, the first declaration applies to target_path
         and each additional declaration is applied at the same lexical base path.
       - If new_code is None, delete the target declaration.
+      - Automatically strips common leading indentation from new_code to be forgiving of
+        helpfully pre-indented code.
 
     Args:
         file_path: Path to the file to modify
@@ -1368,6 +1370,7 @@ def declare(file_path, target_path, new_code=None):
         new_code: The code to insert (optional if target_path contains the code)
     """
     import ast
+    import textwrap
     
     # Check if file_path contains .py followed by more path components
     # This handles cases like "heteromix_training.py.add_artifact_cli_args"
@@ -1394,9 +1397,10 @@ def declare(file_path, target_path, new_code=None):
         # User passed the declaration as second argument
         new_code = target_path
         
-        # Extract the target name from the code
+        # Extract the target name from the code (after dedenting)
+        dedented_code = textwrap.dedent(new_code)
         try:
-            tree = ast.parse(new_code)
+            tree = ast.parse(dedented_code)
             for node in tree.body:
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     target_path = node.name
@@ -1419,8 +1423,14 @@ def declare(file_path, target_path, new_code=None):
                 f"Second argument appears to be code but could not parse target name: {e}\n"
                 f"Either provide valid Python code or use the format: declare(file, 'target_name', code)"
             )
+        # Use the dedented version
+        new_code = dedented_code
     
-    # ... rest of the function remains the same    
+    # Strip common leading indentation from new_code if provided
+    if new_code is not None:
+        new_code = textwrap.dedent(new_code)
+        logging.debug(f"Dedented new_code for consistency")
+    
     logging.debug(f'file: {file_path}')
 
     # Track file for git operations BEFORE modifying it
@@ -1565,7 +1575,6 @@ def declare(file_path, target_path, new_code=None):
 
     with open(file_path, 'w') as f:
         f.write(new_content)
-
 
 # Example usage
 if __name__ == "__main__":
