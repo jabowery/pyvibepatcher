@@ -643,10 +643,20 @@ def replace_block(content: str,
     inferred_kind = None
     inferred_name = None
     
-    # Handle different cases based on content of new_code
+#    # Handle different cases based on content of new_code
+#    if len(mod.body) == 0:
+#        raise ValueError("new_code cannot be empty.")
+
+    if len(new_code.strip()) == 0:
+        # Delete target instead of raising an error
+        if not target_name:
+            raise ValueError("Cannot delete without target_name.")
+        stripped, _ = remove_block(content, target_name, lexical_chain or [])
+        return stripped, True
+
     if len(mod.body) == 0:
-        raise ValueError("new_code cannot be empty.")
-    
+        raise ValueError("new_code cannot be empty (after parsing).")
+
     elif len(mod.body) == 1:
         # Original behavior - single statement
         node = mod.body[0]
@@ -1224,15 +1234,16 @@ CONFIG_PATH = "/etc/myapp/config.yaml"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 """
-def update_declaration(file_path, target_path, new_code=None):
-    """
-    Alias for declare() function - updates a function, class, or assignment in a file.
-    If the target_path exists one or more times, replace all with the new declaration.
-    If new_code is None, the declaration is deleted.
-    
-    This is a convenience alias that provides clearer semantics for code updates.
-    """
-    return declare(file_path, target_path, new_code)
+if False:
+    def update_declaration(file_path, target_path, new_code=None):
+        """
+        Alias for declare() function - updates a function, class, or assignment in a file.
+        If the target_path exists one or more times, replace all with the new declaration.
+        If new_code is None, the declaration is deleted.
+        
+        This is a convenience alias that provides clearer semantics for code updates.
+        """
+        return declare(file_path, target_path, new_code)
 def remove_declaration(file_path, target_path, new_code=None):
     """
     Alias for declare() function - removes a function, class, or assignment from a file.

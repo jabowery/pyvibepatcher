@@ -10,8 +10,6 @@ from code_mod_defs import (
     create_file,
     move_file,
     declare,
-    update_declaration,  # Add this line
-    remove_declaration,  # Add this line
     update_file,
     make_directory,
     remove_file,
