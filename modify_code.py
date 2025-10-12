@@ -1,8 +1,22 @@
-#!/bin/env python
+#!/usr/bin/env python3
+"""
+Robust modification-file parser for the MMM ... MMM / @@@@@@ format.
+
+Key improvements:
+- Separator detection treats any line whose strip() equals '@@@@@@' as a split.
+- Guardrails for declare-style operations:
+  * update_declaration -> MUST have non-empty content (never delete).
+  * remove_declaration -> MUST NOT have content (always delete).
+  * declare -> legacy semantics: empty content => delete; non-empty => add/update.
+- Clearer error messages for misuse, preventing accidental deletions.
+"""
+
+from __future__ import annotations
+
 import sys
+import re
 from pathlib import Path
 from typing import List, Tuple, Any
-import re
 
 from code_mod_defs import (
     apply_modification_set,
@@ -14,9 +28,12 @@ from code_mod_defs import (
     make_directory,
     remove_file,
     update_header,
-    # add others here as you introduce them
+    interactive_rollback,  # assumed to exist in your environment
 )
+
+# Matches lines like: MMM function_name MMM
 _HEADER_RE = re.compile(r'^MMM\s+([A-Za-z_][A-Za-z0-9_]*)\s+MMM\s*')
+
 def _parse_bool(s: str) -> bool:
     s = s.strip().lower()
     if s in {"true", "1", "yes", "y"}:
@@ -26,49 +43,45 @@ def _parse_bool(s: str) -> bool:
     # default: treat non-empty as True
     return bool(s)
 
+def _is_sep_line(ln: str) -> bool:
+    """Return True if the line is a section separator ('@@@@@@'), robust to CRLF and spaces."""
+    return ln.strip() == "@@@@@@"
+
 def _split_sections(block_lines: List[str]) -> List[str]:
     """
-    Split a block's lines into sections using a line that is exactly '@@@@@@'
-    as a separator. Keep inner newlines; strip a single trailing newline.
+    Split a block into text sections using lines whose strip() equals '@@@@@@' as separators.
+    - Preserve inner newlines in each section.
+    - Strip a single trailing newline per section for predictable behavior.
+    - Do NOT drop trailing empty sections here; higher-level logic decides semantics.
     """
     sections: List[List[str]] = [[]]
     for ln in block_lines:
-        if ln[:7] == "@@@@@@\n":
+        if _is_sep_line(ln):
             sections.append([])
         else:
-            if ln[:7] == '\\@@@@@@':    # literal @@@@@@ must be escaped
+            # Allow escaping a literal '@@@@@@' by prefixing with '\'
+            if ln.startswith('\\@@@@@@'):
                 ln = ln[1:]
             sections[-1].append(ln)
+
     out: List[str] = []
     for sec in sections:
         txt = "".join(sec)
-        # strip a single trailing newline, keep interior newlines intact
         if txt.endswith("\n"):
             txt = txt[:-1]
         out.append(txt)
     return out
 
-
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: python modify_code.py <modification_file>")
-        sys.exit(1)
-    
-    modification_file = sys.argv[1]
-    
-    modifications = parse_modification_file(modification_file)
-    
-    manager = apply_modification_set(modifications)
-    print(f"\nModifications complete. Run 'python {sys.argv[0]} rollback' for rollback options.")
 def _resolve_func(name: str):
-    # Extend this map as you add more supported operations
+    """Map function names in the MMM header to callables from code_mod_defs."""
     table = {
         "modification_description": modification_description,
         "create_file": create_file,
         "move_file": move_file,
         "declare": declare,
-        "update_declaration": declare,  # Add this line as synonym
-        "remove_declaration": declare,  # Add this line as synonym
+        # Synonyms routed through 'declare' but with parse-time guardrails:
+        "update_declaration": declare,
+        "remove_declaration": declare,
         "update_file": update_file,
         "make_directory": make_directory,
         "remove_file": remove_file,
@@ -78,20 +91,27 @@ def _resolve_func(name: str):
     if name not in table:
         raise ValueError(f"Unknown modification function: {name}")
     return table[name]
+
+def _has_nonempty_text(s: str | None) -> bool:
+    return s is not None and s.strip() != ""
+
 def parse_modification_file(path: str):
     """
-    Format:
-        mmm <func_name> mmm
+    Parse the given modification file and return a list of entries:
+        List[Tuple[callable, tuple(args), dict(kwargs)]]
+
+    Format per block:
+        MMM <func_name> MMM
         <arg or payload...>
-        @@@@@
+        @@@@@@
         <next arg...>
-        @@@@@
+        @@@@@@
         ... (next block)
-        mmm <func_name> mmm
+        MMM <func_name> MMM
         ...
-    For known funcs we coerce argument types appropriately.
-    Unknown funcs: treat all sections as positional strings.
-    Returns: List[Tuple[callable, tuple(args), dict(kwargs)]]
+
+    Guardrails for declare-like functions are enforced here so downstream code
+    can't accidentally delete when the intent was to update.
     """
     text = Path(path).read_text()
     lines = text.splitlines(keepends=True)
@@ -108,7 +128,7 @@ def parse_modification_file(path: str):
         func_name = m.group(1)
         i += 1
 
-        # collect until next header or EOF
+        # Collect until next header or EOF
         block: List[str] = []
         while i < len(lines) and not _HEADER_RE.match(lines[i]):
             block.append(lines[i])
@@ -117,7 +137,7 @@ def parse_modification_file(path: str):
         sections = _split_sections(block)
         fn = _resolve_func(func_name)
 
-        # Special handling for known signatures:
+        # Special handling for known signatures
         if fn is modification_description:
             if not sections:
                 raise ValueError("modification_description requires one section (the description).")
@@ -128,7 +148,7 @@ def parse_modification_file(path: str):
             if len(sections) < 2:
                 raise ValueError("create_file requires at least 2 sections: path, content, [make_executable].")
             path_arg = sections[0].strip()
-            content_arg = sections[1]  # preserve newlines
+            content_arg = sections[1]
             make_exec = _parse_bool(sections[2]) if len(sections) >= 3 else False
             args = (path_arg, content_arg)
             kwargs = {"make_executable": make_exec}
@@ -137,7 +157,7 @@ def parse_modification_file(path: str):
             if len(sections) < 2:
                 raise ValueError("update_file requires at least 2 sections: path, content, [make_executable].")
             path_arg = sections[0].strip()
-            content_arg = sections[1]  # preserve newlines
+            content_arg = sections[1]
             make_exec = _parse_bool(sections[2]) if len(sections) >= 3 else False
             args = (path_arg, content_arg)
             kwargs = {"make_executable": make_exec}
@@ -150,12 +170,26 @@ def parse_modification_file(path: str):
             args = (src, dst)
             kwargs = {}
 
-        elif fn is declare:  # This handles 'declare', 'update_declaration', and 'remove_declaration' since they resolve to the same function
+        elif fn is declare:
+            # For declare/update_declaration/remove_declaration apply guardrails at parse time
             if len(sections) < 2:
-                raise ValueError(f"{func_name} requires 2 sections: file_path, name, content (or None for deletion).")
+                raise ValueError(f"{func_name} requires 2+ sections: file_path, target_path, [content].")
+
             file_path = sections[0].strip()
             name = sections[1].strip()
-            content = sections[2] if len(sections) == 3 else None
+            content = sections[2] if len(sections) >= 3 else None
+
+            if func_name == "update_declaration":
+                if not _has_nonempty_text(content):
+                    raise ValueError("update_declaration requires a NON-empty content section; it cannot delete. If you intend deletion, use remove_declaration.")
+            elif func_name == "remove_declaration":
+                if _has_nonempty_text(content):
+                    raise ValueError("remove_declaration must NOT include a content section. Omit it to delete.")
+                content = None  # deletion semantics
+            else:  # bare 'declare' keeps legacy: empty => delete, non-empty => add/update
+                if content is not None and content.strip() == "":
+                    content = None  # normalize empty-string payload to deletion
+
             args = (file_path, name, content)
             kwargs = {}
 
@@ -178,12 +212,12 @@ def parse_modification_file(path: str):
             if len(sections) < 2:
                 raise ValueError("update_header requires 2 sections: file_path, header_content.")
             file_path_arg = sections[0].strip()
-            header_content_arg = sections[1]  # preserve newlines and formatting
+            header_content_arg = sections[1]
             args = (file_path_arg, header_content_arg)
             kwargs = {}
 
         else:
-            # Fallback: all sections as positional strings
+            # Fallback: pass all sections as positional strings
             args = tuple(sections)
             kwargs = {}
 
@@ -194,8 +228,19 @@ def parse_modification_file(path: str):
 
     return entries
 
-if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == 'rollback':
+def main():
+    if len(sys.argv) == 2 and sys.argv[1] == 'rollback':
         interactive_rollback()
-    else:
-        main()
+        return
+
+    if len(sys.argv) != 2:
+        print("Usage: python modify_code.py <modification_file>\n       python modify_code.py rollback")
+        sys.exit(1)
+
+    modification_file = sys.argv[1]
+    modifications = parse_modification_file(modification_file)
+    manager = apply_modification_set(modifications)
+    print("\nModifications complete. Use 'python modify_code.py rollback' for rollback options.")
+
+if __name__ == "__main__":
+    main()
