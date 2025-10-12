@@ -73,9 +73,9 @@ Empty for now though.
 MMM make_directory MMM
 tests/unit
 
-Provide these directives in a code section of the chat panel.
+If a function is getting too long and a better refactoring isn't apparent, decompose it into lexically nested sub-functions.
 
-If a function is getting too long, and it becomes tempting to violate compliance by replacing only a part of it, choose instead to refactor it into subfunctions and then update the relevant subfunction.
+Provide these directives in a code section of the chat panel.
 
 Only change symbol names when behavior changes
 Unless otherwise specified, provide tracebacks from except: blocks.
