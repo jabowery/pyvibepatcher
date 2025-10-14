@@ -1430,7 +1430,6 @@ def declare(file_path, target_path, new_code=None):
         target_path: Either a dotted path like "ClassName.method" OR the actual code to insert
         new_code: The code to insert (optional if target_path contains the code)
     """
-    
     # Check if file_path contains .py followed by more path components
     # This handles cases like "heteromix_training.py.add_artifact_cli_args"
     if '.py.' in file_path:
