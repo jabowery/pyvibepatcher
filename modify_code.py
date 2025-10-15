@@ -6,9 +6,10 @@ Key improvements:
 - Separator detection treats any line whose strip() equals '@@@@@@' as a split.
 - Guardrails for declare-style operations:
   * update_declaration -> MUST have non-empty content (never delete).
-  * remove_declaration -> MUST NOT have content (always delete).
+  * remove_declaration -> dedicated function; MUST NOT have content (always delete).
   * declare -> legacy semantics: empty content => delete; non-empty => add/update.
 - Clearer error messages for misuse, preventing accidental deletions.
+- **NEW**: First split the entire file into ^MMM command blocks before processing.
 """
 
 from __future__ import annotations
@@ -28,7 +29,8 @@ from code_mod_defs import (
     make_directory,
     remove_file,
     update_header,
-    interactive_rollback,  # assumed to exist in your environment
+    remove_declaration,       # NEW: import dedicated function
+    interactive_rollback,     # assumed to exist in your environment
 )
 
 # Matches lines like: MMM function_name MMM
@@ -72,28 +74,61 @@ def _split_sections(block_lines: List[str]) -> List[str]:
         out.append(txt)
     return out
 
+
 def _resolve_func(name: str):
-    """Map function names in the MMM header to callables from code_mod_defs."""
+    """
+    Map modification command names to callables.
+    Extend here if you add new commands.
+    """
     table = {
         "modification_description": modification_description,
         "create_file": create_file,
-        "move_file": move_file,
-        "declare": declare,
-        # Synonyms routed through 'declare' but with parse-time guardrails:
-        "update_declaration": declare,
-        "remove_declaration": declare,
         "update_file": update_file,
+        "move_file": move_file,
         "make_directory": make_directory,
         "remove_file": remove_file,
-        "delete_file": remove_file,
+        "declare": declare,
+        "update_declaration": declare,           # alias
+        "remove_declaration": remove_declaration,
         "update_header": update_header,
     }
-    if name not in table:
-        raise ValueError(f"Unknown modification function: {name}")
-    return table[name]
+    return table.get(name)
+
+
 
 def _has_nonempty_text(s: str | None) -> bool:
     return s is not None and s.strip() != ""
+
+def _split_command_blocks(lines: List[str]) -> List[Tuple[str, List[str]]]:
+    """
+    First pass: split the entire file into command blocks using ^MMM <name> MMM headers.
+    Returns a list of (func_name, block_lines) where block_lines excludes the header
+    and runs up to (but not including) the next header (or EOF).
+    """
+    blocks: List[Tuple[str, List[str]]] = []
+    i = 0
+    current_name: str | None = None
+    current_block: List[str] = []
+
+    while i < len(lines):
+        m = _HEADER_RE.match(lines[i])
+        if m:
+            # Commit the previous block if any
+            if current_name is not None:
+                blocks.append((current_name, current_block))
+            # Start a new block
+            current_name = m.group(1)
+            current_block = []
+        else:
+            if current_name is not None:
+                current_block.append(lines[i])
+        i += 1
+
+    # Commit the trailing block
+    if current_name is not None:
+        blocks.append((current_name, current_block))
+
+    return blocks
 
 def parse_modification_file(path: str):
     """
@@ -116,24 +151,12 @@ def parse_modification_file(path: str):
     text = Path(path).read_text()
     lines = text.splitlines(keepends=True)
 
-    i = 0
     entries: List[Tuple[Any, tuple, dict]] = []
 
-    while i < len(lines):
-        m = _HEADER_RE.match(lines[i])
-        if not m:
-            i += 1
-            continue
+    # **NEW**: First split the full file into command blocks by MMM headers
+    blocks = _split_command_blocks(lines)
 
-        func_name = m.group(1)
-        i += 1
-
-        # Collect until next header or EOF
-        block: List[str] = []
-        while i < len(lines) and not _HEADER_RE.match(lines[i]):
-            block.append(lines[i])
-            i += 1
-
+    for func_name, block in blocks:
         sections = _split_sections(block)
         fn = _resolve_func(func_name)
 
@@ -171,7 +194,7 @@ def parse_modification_file(path: str):
             kwargs = {}
 
         elif fn is declare:
-            # For declare/update_declaration/remove_declaration apply guardrails at parse time
+            # For declare/update_declaration apply guardrails at parse time
             if len(sections) < 2:
                 raise ValueError(f"{func_name} requires 2+ sections: file_path, target_path, [content].")
 
@@ -182,15 +205,22 @@ def parse_modification_file(path: str):
             if func_name == "update_declaration":
                 if not _has_nonempty_text(content):
                     raise ValueError("update_declaration requires a NON-empty content section; it cannot delete. If you intend deletion, use remove_declaration.")
-            elif func_name == "remove_declaration":
-                if _has_nonempty_text(content):
-                    raise ValueError("remove_declaration must NOT include a content section. Omit it to delete.")
-                content = None  # deletion semantics
             else:  # bare 'declare' keeps legacy: empty => delete, non-empty => add/update
                 if content is not None and content.strip() == "":
                     content = None  # normalize empty-string payload to deletion
 
             args = (file_path, name, content)
+            kwargs = {}
+
+        elif fn is remove_declaration:
+            # Dedicated deletion primitive: exactly two sections; no content allowed
+            if len(sections) < 2:
+                raise ValueError("remove_declaration requires 2 sections: file_path, target_path (no content).")
+            if len(sections) >= 3 and _has_nonempty_text(sections[2]):
+                raise ValueError("remove_declaration must NOT include a content section. Provide only file_path and target_path.")
+            file_path = sections[0].strip()
+            name = sections[1].strip()
+            args = (file_path, name)
             kwargs = {}
 
         elif fn is make_directory:

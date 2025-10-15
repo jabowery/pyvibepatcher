@@ -1412,84 +1412,123 @@ def _extract_declarations_with_parents(src: str):
     
     return result
 
+def remove_declaration(file_path: str, target_path: str) -> None:
+    """
+    Strictly REMOVE a function/class/assignment designated by target_path from file_path.
+    - No replacement is allowed here (use declare() for additions/updates).
+    - Raises ValueError if the target is not found.
+
+    Args:
+        file_path: Path to the Python source file to modify
+        target_path: Dotted lexical path like "ClassName.method_name" or "CONST_NAME"
+    """
+    # Track file for git operations BEFORE modifying it
+    if hasattr(remove_declaration, '_rollback_manager'):
+        remove_declaration._rollback_manager.track_file(file_path)
+
+    with open(file_path, 'r') as f:
+        content = f.read()
+
+    target_name, lexical_chain = parse_lexical_chain(target_path)
+
+    new_content, removed = remove_block(content, target_name, lexical_chain)
+    if not removed:
+        error_msg = (
+            f"remove_declaration(): target '{target_name}' not found at "
+            f"{'.'.join(lexical_chain) or '<module>'} in {file_path}"
+        )
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+
+    with open(file_path, 'w') as f:
+        f.write(new_content)
+
+
 def declare(file_path, target_path, new_code=None):
     """
-    Declare a function, class, or assignment in a file with code using lexical chain support.
+    Declare/Update a function, class, or assignment in a file with lexical-chain support.
 
-    Extensions:
-      - If target_path looks like Python code (contains 'def', 'class', or '='), it's treated
-        as the declaration itself, and the target name is automatically extracted.
-      - If new_code contains multiple declarations, the first declaration applies to target_path
-        and each additional declaration is applied at the same lexical base path.
-      - If new_code is None, delete the target declaration.
-      - Automatically strips common leading indentation from new_code to be forgiving of
-        helpfully pre-indented code.
+    IMPORTANT:
+      * This function NOW REQUIRES NON-EMPTY CODE. If you want to delete, call remove_declaration().
+      * "Empty in any sense" means:
+          - new_code is None
+          - new_code is all whitespace after dedent
+          - new_code parses to an empty module (e.g., only comments/blank lines)
+          - auto-detected code from target_path is empty by the same criteria
+
+    Extended behaviors (unchanged):
+      - If target_path looks like code (contains 'def', 'class', '=', or 'async def'),
+        we treat target_path as the declaration and auto-extract the name.
+      - If new_code has multiple declarations, they are applied at the same lexical base path.
 
     Args:
         file_path: Path to the file to modify
-        target_path: Either a dotted path like "ClassName.method" OR the actual code to insert
-        new_code: The code to insert (optional if target_path contains the code)
+        target_path: Dotted path like "ClassName.method" OR the actual code (see above)
+        new_code: Code to insert (optional if target_path contains the code)
     """
-    # Check if file_path contains .py followed by more path components
-    # This handles cases like "heteromix_training.py.add_artifact_cli_args"
+    # Handle combined path "file.py.Class.method" convenience
     if '.py.' in file_path:
         py_index = file_path.index('.py.')
-        actual_file_path = file_path[:py_index + 3]  # Include the '.py'
-        remaining_path = file_path[py_index + 4:]  # Everything after '.py.'
-        
-        # If we're in 2-arg form (target_path is code), use remaining_path as target
+        actual_file_path = file_path[:py_index + 3]
+        remaining_path = file_path[py_index + 4:]
         if target_path and any(kw in target_path for kw in ['def ', 'class ', '= ', 'async def ']):
             new_code = target_path
             target_path = remaining_path
             file_path = actual_file_path
             logging.info(f"Extracted filepath '{file_path}' and target '{target_path}' from combined path")
         else:
-            # 3-arg form: shift everything
-            new_code = new_code
             target_path = remaining_path
             file_path = actual_file_path
             logging.info(f"Extracted filepath '{file_path}' and target '{target_path}' from combined path")
-    
-    # Auto-detect if target_path is actually the code declaration
+
+    # If caller passed the declaration in target_path, auto-extract the name
     if new_code is None and target_path and any(kw in target_path for kw in ['def ', 'class ', '= ', 'async def ']):
-        # User passed the declaration as second argument
-        new_code = target_path
-        
-        # Extract the target name from the code (after dedenting)
-        dedented_code = textwrap.dedent(new_code)
+        dedented_code = textwrap.dedent(target_path)
+        if dedented_code.strip() == "":
+            raise ValueError("declare(): empty code detected (after dedent). Use remove_declaration() for deletions.")
         try:
             tree = ast.parse(dedented_code)
+            if not getattr(tree, "body", None):  # empty module => only comments/whitespace
+                raise ValueError("declare(): code parses to an empty module (likely only comments/whitespace).")
+            # Extract a sensible default name
+            extracted = False
             for node in tree.body:
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     target_path = node.name
-                    logging.info(f"Auto-detected target name '{target_path}' from declaration")
+                    extracted = True
                     break
-                elif isinstance(node, ast.Assign):
-                    if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                        target_path = node.targets[0].id
-                        logging.info(f"Auto-detected target name '{target_path}' from assignment")
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    nm = None
+                    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                        nm = node.targets[0].id
+                    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                        nm = node.target.id
+                    if nm:
+                        target_path = nm
+                        extracted = True
                         break
-                elif isinstance(node, ast.AnnAssign):
-                    if isinstance(node.target, ast.Name):
-                        target_path = node.target.id
-                        logging.info(f"Auto-detected target name '{target_path}' from annotated assignment")
-                        break
-            else:
-                raise ValueError("Could not extract target name from declaration")
-        except (SyntaxError, ValueError) as e:
-            raise ValueError(
-                f"Second argument appears to be code but could not parse target name: {e}\n"
-                f"Either provide valid Python code or use the format: declare(file, 'target_name', code)"
-            )
-        # Use the dedented version
+            if not extracted:
+                raise ValueError("declare(): could not extract a target name from the provided code.")
+        except SyntaxError as e:
+            raise ValueError(f"declare(): provided code failed to parse: {e}")
         new_code = dedented_code
-    
-    # Strip common leading indentation from new_code if provided
-    if new_code is not None:
-        new_code = textwrap.dedent(new_code)
-        logging.debug(f"Dedented new_code for consistency")
-    
-    logging.debug(f'file: {file_path}')
+
+    # From here on, new_code must be present and non-empty in every meaningful sense
+    if new_code is None:
+        raise ValueError("declare(): missing code. Use remove_declaration() for deletions.")
+
+    new_code = textwrap.dedent(new_code)
+    if new_code.strip() == "":
+        raise ValueError("declare(): empty code after dedent. Use remove_declaration() for deletions.")
+
+    try:
+        parsed = ast.parse(new_code)
+    except SyntaxError as e:
+        raise ValueError(f"declare(): code failed to parse: {e}")
+
+    if not getattr(parsed, "body", None):
+        # Only comments/whitespace
+        raise ValueError("declare(): code parses to an empty module (only comments/whitespace).")
 
     # Track file for git operations BEFORE modifying it
     if hasattr(declare, '_rollback_manager'):
@@ -1500,34 +1539,22 @@ def declare(file_path, target_path, new_code=None):
 
     target_name, lexical_chain = parse_lexical_chain(target_path)
 
-    # ----- DELETE fast-path -----
-    if new_code is None:
-        new_content, removed = remove_block(content, target_name, lexical_chain)
-        if not removed:
-            error_msg = (
-                f"Error removing '{target_name}': target not found at chain "
-                f"{'.'.join(lexical_chain) or '<module>'}"
-            )
-            logging.error(error_msg)
-            raise ValueError(error_msg)
-        with open(file_path, 'w') as f:
-            f.write(new_content)
-        return
-
-
+    # Extract top-level declarations from the provided code (to support multi-decl payloads)
     decls = _extract_declarations_with_parents(new_code)
+    if len(decls) == 0:
+        raise ValueError("declare(): no top-level function/class/assignment found in code payload.")
 
-    # If we only found one declaration, fall back to the original single-target behavior
+    # If we only found one declaration, keep the original single-target behavior
     if len(decls) <= 1:
-        # Force fallback for assignments since replace_block is broken for them
+        # For assignments, prefer remove+insert fallback
         if target_name in content and '=' in new_code:
-            new_content, removed = remove_block(content, target_name, lexical_chain)
+            c2, removed = remove_block(content, target_name, lexical_chain)
             if removed:
-                new_content = insert_block(new_content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+                new_content = insert_block(c2, new_code, target_name=target_name, lexical_chain=lexical_chain)
             else:
                 new_content = insert_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
         else:
-            # Use normal replace logic for functions/classes
+            # Use replace path for defs/classes
             new_content, was_replaced = replace_block(
                 content, new_code, target_name=target_name, lexical_chain=lexical_chain
             )
@@ -1538,26 +1565,18 @@ def declare(file_path, target_path, new_code=None):
             f.write(new_content)
         return
 
-    # Multi-declaration path
+    # Multi-declaration path: apply target-matching decl first, then the rest
     new_content = content
-
-    # First declaration: prefer the code whose inferred name matches target_name
     first_idx = 0
     for i, (nm, _) in enumerate(decls):
         if nm == target_name:
             first_idx = i
             break
-    if decls[first_idx][0] != target_name:
-        logging.warning(
-            f"declare(): first inferred name '{decls[first_idx][0]}' does not match target '{target_name}'. Proceeding."
-        )
 
-    # Reorder so the target-matching declaration is applied first
     first_decl = decls[first_idx]
-    rest_decls = decls[:first_idx] + decls[first_idx+1:]
+    rest_decls = decls[:first_idx] + decls[first_idx + 1:]
 
     def _apply_one(curr_content: str, nm: str, code_text: str) -> str:
-        # For assignments, prefer the remove+insert fallback
         if nm in curr_content and '=' in code_text:
             c2, removed = remove_block(curr_content, nm, lexical_chain)
             if removed:
@@ -1569,13 +1588,14 @@ def declare(file_path, target_path, new_code=None):
                 c2 = insert_block(curr_content, code_text, target_name=nm, lexical_chain=lexical_chain)
             return c2
 
-    # Apply the first, then the rest
     new_content = _apply_one(new_content, first_decl[0], first_decl[1])
     for nm, code_text in rest_decls:
         new_content = _apply_one(new_content, nm, code_text)
 
     with open(file_path, 'w') as f:
         f.write(new_content)
+
+
 
 # Example usage
 if __name__ == "__main__":
