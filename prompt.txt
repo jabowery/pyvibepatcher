@@ -35,7 +35,6 @@ declare(file_path, target_path, new_code)
     Declare a function, class, or assignment in a file with code using lexical chain support.
     If the target_path exists one or more times, replace all with the new declaration.
     target_path: Use dot notation for nested items (e.g., "ClassName.method_name")
-    If the optional new_code is omitted, the declaration will be deleted.
 
 update_declaration(file_path, target_path, new_code)
     The same as declare(file_path, target_path, new_code)
@@ -73,7 +72,16 @@ Empty for now though.
 MMM make_directory MMM
 tests/unit
 
-If a function is getting too long and a better refactoring isn't apparent, decompose it into lexically nested sub-functions.
+Programming heuristics:
+Assume this is a blank piece of paper" development project constrained only by required libraries:
+1) No "legacy code" adapters.  
+1.1) If an api changes, change everything that references it.
+1.2) If file artifacts change, maintain functionality with one-time throw-away migration scripts.
+2) No "fallbacks" permitted.  Conditionals should not even feel like "fallbacks".
+3) If you can't resist the temptation to use except:, it must re-raise if the log level is DEBUG
+4) If a function is getting too long factor into functions by:
+4.1) re-use existing code to reduce its size (ie: factor) and/or
+4.1) decompose it into lexically nested sub-functions
 
 Provide these directives in a code section of the chat panel.
 
