@@ -1,7 +1,7 @@
 import textwrap
 from pathlib import Path
 
-from code_mod_defs import declare, parse_lexical_chain
+from code_mod_defs import declare, parse_lexical_chain, remove_declaration
 
 def test_parse_lexical_chain_top_level():
     name, chain = parse_lexical_chain("foo")
@@ -31,7 +31,7 @@ def test_replace_insert_delete_roundtrip(tmp_path):
     assert "return 2" in s and "return 1" not in s
 
     # delete the def
-    declare(str(p), "foo", None)
+    remove_declaration(str(p), "foo")
     s = p.read_text()
     assert "def foo" not in s
 
@@ -51,7 +51,7 @@ def test_nested_insertion_and_deletion(tmp_path):
     assert "def c(self)" in s
 
     # delete method b
-    declare(str(p), "A.b", None)
+    remove_declaration(str(p), "A.b")
     s = p.read_text()
     assert "def b(" not in s
 
@@ -63,6 +63,6 @@ def test_assignment_replace_and_delete(tmp_path):
     s = p.read_text()
     assert "x = 42" in s and "y = 2" in s
     # delete y
-    declare(str(p), "y", None)
+    remove_declaration(str(p), "y")
     s = p.read_text()
     assert "y = 2" not in s
