@@ -43,7 +43,14 @@ remove_declaration(file_path, target_path)
 
 update_header(file_path, new_code)
     new_code replaces the module header: all lines up to the first declaration (def or class).
-    
+
+Natural-Language Modification Prohibition
+    Modification descriptions must NOT include instructions such as:
+        "rest unchanged", "keep the rest the same", "only this part changes",
+        "leave everything else intact", etc.
+    Preservation of code is implicit: anything not covered by a modification function
+    remains unchanged automatically. Natural-language fallback instructions are prohibited.
+
 Example Modification File
 
 MMM modification_description MMM
@@ -72,6 +79,8 @@ Empty for now though.
 MMM make_directory MMM
 tests/unit
 
+If a function is nearing 100 lines long, divide it into lexically subordinate functions.
+
 Programming heuristics:
 Assume this is a blank piece of paper" development project constrained only by required libraries:
 1) No "legacy code" adapters.  
@@ -79,9 +88,6 @@ Assume this is a blank piece of paper" development project constrained only by r
 1.2) If file artifacts change, maintain functionality with one-time throw-away migration scripts.
 2) No "fallbacks" permitted.  Conditionals should not even feel like "fallbacks".
 3) If you can't resist the temptation to use except:, it must re-raise if the log level is DEBUG
-4) If a function is getting too long factor into functions by:
-4.1) re-use existing code to reduce its size (ie: factor) and/or
-4.1) decompose it into lexically nested sub-functions
 
 Provide these directives in a code section of the chat panel.
 

@@ -1234,25 +1234,6 @@ CONFIG_PATH = "/etc/myapp/config.yaml"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 """
-if False:
-    def update_declaration(file_path, target_path, new_code=None):
-        """
-        Alias for declare() function - updates a function, class, or assignment in a file.
-        If the target_path exists one or more times, replace all with the new declaration.
-        If new_code is None, the declaration is deleted.
-        
-        This is a convenience alias that provides clearer semantics for code updates.
-        """
-        return declare(file_path, target_path, new_code)
-def remove_declaration(file_path, target_path, new_code=None):
-    """
-    Alias for declare() function - removes a function, class, or assignment from a file.
-    If new_code is provided, replaces the declaration instead of removing it.
-    If new_code is None, the declaration is deleted.
-    
-    This is a convenience alias that provides clearer semantics for code removal.
-    """
-    return declare(file_path, target_path, new_code)
 
 def apply_modification_set(modifications, auto_rollback_on_failure=True, auto_commit=None, commit_message=None):
     """
