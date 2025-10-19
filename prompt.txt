@@ -27,7 +27,7 @@ create_file(file_path, file_content, make_executable=True)
 move_file(src, dst)
 make_directory(path)
 remove_file(path, recursive=False)
-update_file(path, file_content)
+replace_file_contents(path, file_content)
 
 Code Modifications
 
@@ -44,12 +44,10 @@ remove_declaration(file_path, target_path)
 update_header(file_path, new_code)
     new_code replaces the module header: all lines up to the first declaration (def or class).
 
-Natural-Language Modification Prohibition
-    Modification descriptions must NOT include instructions such as:
-        "rest unchanged", "keep the rest the same", "only this part changes",
+Natural-Language Modification Instructions Are Prohibited
+    Modification descriptions must NOT elide original content with natural language instructions such as:
+        "rest unchanged", "keep the rest the same", "existing code goes here" 
         "leave everything else intact", etc.
-    Preservation of code is implicit: anything not covered by a modification function
-    remains unchanged automatically. Natural-language fallback instructions are prohibited.
 
 Example Modification File
 

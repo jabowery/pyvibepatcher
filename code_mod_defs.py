@@ -1000,7 +1000,7 @@ def open_with_mkdir(filepath, mode='w', **kwargs):
     # Open and return the file object
     return open(filepath, mode=mode, **kwargs)
 
-def update_file(file_path, file_content, make_executable=False):
+def replace_file_contents(file_path, file_content, make_executable=False):
     if os.path.exists(file_path):
         remove_file(file_path)
     create_file(file_path, file_content, make_executable=make_executable)

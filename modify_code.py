@@ -25,7 +25,7 @@ from code_mod_defs import (
     create_file,
     move_file,
     declare,
-    update_file,
+    replace_file_contents,
     make_directory,
     remove_file,
     update_header,
@@ -83,7 +83,7 @@ def _resolve_func(name: str):
     table = {
         "modification_description": modification_description,
         "create_file": create_file,
-        "update_file": update_file,
+        "replace_file_contents": replace_file_contents,
         "move_file": move_file,
         "make_directory": make_directory,
         "remove_file": remove_file,
@@ -176,9 +176,9 @@ def parse_modification_file(path: str):
             args = (path_arg, content_arg)
             kwargs = {"make_executable": make_exec}
 
-        elif fn is update_file:
+        elif fn is replace_file_contents:
             if len(sections) < 2:
-                raise ValueError("update_file requires at least 2 sections: path, content, [make_executable].")
+                raise ValueError("replace_file_contents requires at least 2 sections: path, content, [make_executable].")
             path_arg = sections[0].strip()
             content_arg = sections[1]
             make_exec = _parse_bool(sections[2]) if len(sections) >= 3 else False
