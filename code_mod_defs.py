@@ -918,7 +918,7 @@ def remove_file(path, recursive=False):
     if recursive and os.path.isdir(path):
         shutil.rmtree(path)
         logging.debug(f"Removed directory {path} recursively")
-    elif os.path.isfile(path):
+    elif os.path.isfile(path) or os.path.islink(path):
         os.remove(path)
         logging.debug(f"Removed file {path}")
     elif os.path.isdir(path):
