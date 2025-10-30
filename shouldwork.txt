@@ -1,0 +1,32 @@
+MMM declare MMM
+mdlloss_flow.py
+@@@@@@
+MDLLossFlow.compute_gaussian_nll_bits
+@@@@@@
+    @torch.no_grad()
+    def compute_gaussian_nll_bits(self, residuals: torch.Tensor) -> torch.Tensor:
+        """
+        Compute Gaussian NLL in bits for residuals.
+        Uses robust MAD-based scale estimation.
+        
+        Args:
+            residuals: [n, d] residuals in log1p space
+            
+        Returns:
+            Scalar tensor: total NLL in bits
+        """
+        r64 = residuals.to(torch.float64)
+        
+        # Robust scale estimation per feature
+        mad = torch.median(torch.abs(r64 - torch.median(r64, dim=0).values), dim=0).values.clamp_min(1e-12)
+        sigma = 1.4826 * mad
+        sigma = torch.maximum(sigma, torch.full_like(sigma, 1e-3))
+        
+        # Gaussian NLL in bits
+        n = r64.shape[0]
+        nll_bits = 0.5 * torch.sum((r64 / sigma.unsqueeze(0))**2) / torch.log(torch.tensor(2.0, dtype=torch.float64))
+        
+        # Add normalization constant: -log2(sqrt(2π)σ) per sample per feature
+        norm_bits = n * torch.sum(0.5 * torch.log2(2.0 * torch.pi * sigma**2))
+        
+        return nll_bits + norm_bits

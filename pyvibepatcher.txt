@@ -1,0 +1,4498 @@
+File: modify_code.py
+#!/usr/bin/env python3
+"""
+Robust modification-file parser for the MMM ... MMM / @@@@@@ format.
+
+Key improvements:
+- Separator detection treats any line whose strip() equals '@@@@@@' as a split.
+- Guardrails for declare-style operations:
+  * update_declaration -> MUST have non-empty content (never delete).
+  * remove_declaration -> dedicated function; MUST NOT have content (always delete).
+  * declare -> legacy semantics: empty content => delete; non-empty => add/update.
+- Clearer error messages for misuse, preventing accidental deletions.
+- **NEW**: First split the entire file into ^MMM command blocks before processing.
+"""
+
+from __future__ import annotations
+
+import sys
+import re
+from pathlib import Path
+from typing import List, Tuple, Any
+
+from code_mod_defs import (
+    apply_modification_set,
+    modification_description,
+    create_file,
+    move_file,
+    declare,
+    replace_file_contents,
+    make_directory,
+    remove_file,
+    update_header,
+    remove_declaration,       # NEW: import dedicated function
+    interactive_rollback,     # assumed to exist in your environment
+)
+
+# Matches lines like: MMM function_name MMM
+_HEADER_RE = re.compile(r'^MMM\s+([A-Za-z_][A-Za-z0-9_]*)\s+MMM\s*')
+
+def _parse_bool(s: str) -> bool:
+    s = s.strip().lower()
+    if s in {"true", "1", "yes", "y"}:
+        return True
+    if s in {"false", "0", "no", "n"}:
+        return False
+    # default: treat non-empty as True
+    return bool(s)
+
+def _is_sep_line(ln: str) -> bool:
+    """Return True if the line is a section separator ('@@@@@@'), robust to CRLF and spaces."""
+    return ln.strip() == "@@@@@@"
+
+def _split_sections(block_lines: List[str]) -> List[str]:
+    """
+    Split a block into text sections using lines whose strip() equals '@@@@@@' as separators.
+    - Preserve inner newlines in each section.
+    - Strip a single trailing newline per section for predictable behavior.
+    - Do NOT drop trailing empty sections here; higher-level logic decides semantics.
+    """
+    sections: List[List[str]] = [[]]
+    for ln in block_lines:
+        if _is_sep_line(ln):
+            sections.append([])
+        else:
+            # Allow escaping a literal '@@@@@@' by prefixing with '\'
+            if ln.startswith('\\@@@@@@'):
+                ln = ln[1:]
+            sections[-1].append(ln)
+
+    out: List[str] = []
+    for sec in sections:
+        txt = "".join(sec)
+        if txt.endswith("\n"):
+            txt = txt[:-1]
+        out.append(txt)
+    return out
+
+
+def _resolve_func(name: str):
+    """
+    Map modification command names to callables.
+    Extend here if you add new commands.
+    """
+    table = {
+        "modification_description": modification_description,
+        "create_file": create_file,
+        "replace_file_contents": replace_file_contents,
+        "move_file": move_file,
+        "make_directory": make_directory,
+        "remove_file": remove_file,
+        "declare": declare,
+        "update_declaration": declare,           # alias
+        "remove_declaration": remove_declaration,
+        "update_header": update_header,
+    }
+    return table.get(name)
+
+
+
+def _has_nonempty_text(s: str | None) -> bool:
+    return s is not None and s.strip() != ""
+
+def _split_command_blocks(lines: List[str]) -> List[Tuple[str, List[str]]]:
+    """
+    First pass: split the entire file into command blocks using ^MMM <name> MMM headers.
+    Returns a list of (func_name, block_lines) where block_lines excludes the header
+    and runs up to (but not including) the next header (or EOF).
+    """
+    blocks: List[Tuple[str, List[str]]] = []
+    i = 0
+    current_name: str | None = None
+    current_block: List[str] = []
+
+    while i < len(lines):
+        m = _HEADER_RE.match(lines[i])
+        if m:
+            # Commit the previous block if any
+            if current_name is not None:
+                blocks.append((current_name, current_block))
+            # Start a new block
+            current_name = m.group(1)
+            current_block = []
+        else:
+            if current_name is not None:
+                current_block.append(lines[i])
+        i += 1
+
+    # Commit the trailing block
+    if current_name is not None:
+        blocks.append((current_name, current_block))
+
+    return blocks
+
+def parse_modification_file(path: str):
+    """
+    Parse the given modification file and return a list of entries:
+        List[Tuple[callable, tuple(args), dict(kwargs)]]
+
+    Format per block:
+        MMM <func_name> MMM
+        <arg or payload...>
+        @@@@@@
+        <next arg...>
+        @@@@@@
+        ... (next block)
+        MMM <func_name> MMM
+        ...
+
+    Guardrails for declare-like functions are enforced here so downstream code
+    can't accidentally delete when the intent was to update.
+    """
+    text = Path(path).read_text()
+    lines = text.splitlines(keepends=True)
+
+    entries: List[Tuple[Any, tuple, dict]] = []
+
+    # **NEW**: First split the full file into command blocks by MMM headers
+    blocks = _split_command_blocks(lines)
+
+    for func_name, block in blocks:
+        sections = _split_sections(block)
+        fn = _resolve_func(func_name)
+
+        # Special handling for known signatures
+        if fn is modification_description:
+            if not sections:
+                raise ValueError("modification_description requires one section (the description).")
+            args = (sections[0],)
+            kwargs = {}
+
+        elif fn is create_file:
+            if len(sections) < 2:
+                raise ValueError("create_file requires at least 2 sections: path, content, [make_executable].")
+            path_arg = sections[0].strip()
+            content_arg = sections[1]
+            make_exec = _parse_bool(sections[2]) if len(sections) >= 3 else False
+            args = (path_arg, content_arg)
+            kwargs = {"make_executable": make_exec}
+
+        elif fn is replace_file_contents:
+            if len(sections) < 2:
+                raise ValueError("replace_file_contents requires at least 2 sections: path, content, [make_executable].")
+            path_arg = sections[0].strip()
+            content_arg = sections[1]
+            make_exec = _parse_bool(sections[2]) if len(sections) >= 3 else False
+            args = (path_arg, content_arg)
+            kwargs = {"make_executable": make_exec}
+
+        elif fn is move_file:
+            if len(sections) < 2:
+                raise ValueError("move_file requires 2 sections: src, dst.")
+            src = sections[0].strip()
+            dst = sections[1].strip()
+            args = (src, dst)
+            kwargs = {}
+
+        elif fn is declare:
+            # For declare/update_declaration apply guardrails at parse time
+            if len(sections) < 2:
+                raise ValueError(f"{func_name} requires 2+ sections: file_path, target_path, [content].")
+
+            file_path = sections[0].strip()
+            name = sections[1].strip()
+            content = sections[2] if len(sections) >= 3 else None
+
+            if func_name == "update_declaration":
+                if not _has_nonempty_text(content):
+                    raise ValueError("update_declaration requires a NON-empty content section; it cannot delete. If you intend deletion, use remove_declaration.")
+            else:  # bare 'declare' keeps legacy: empty => delete, non-empty => add/update
+                if content is not None and content.strip() == "":
+                    content = None  # normalize empty-string payload to deletion
+
+            args = (file_path, name, content)
+            kwargs = {}
+
+        elif fn is remove_declaration:
+            # Dedicated deletion primitive: exactly two sections; no content allowed
+            if len(sections) < 2:
+                raise ValueError("remove_declaration requires 2 sections: file_path, target_path (no content).")
+            if len(sections) >= 3 and _has_nonempty_text(sections[2]):
+                raise ValueError("remove_declaration must NOT include a content section. Provide only file_path and target_path.")
+            file_path = sections[0].strip()
+            name = sections[1].strip()
+            args = (file_path, name)
+            kwargs = {}
+
+        elif fn is make_directory:
+            if len(sections) < 1:
+                raise ValueError("make_directory requires 1 section: path.")
+            path_arg = sections[0].strip()
+            args = (path_arg,)
+            kwargs = {}
+
+        elif fn is remove_file:
+            if len(sections) < 1:
+                raise ValueError("remove_file requires at least 1 section: path, [recursive].")
+            path_arg = sections[0].strip()
+            recursive = _parse_bool(sections[1]) if len(sections) >= 2 else False
+            args = (path_arg,)
+            kwargs = {"recursive": recursive}
+
+        elif fn is update_header:
+            if len(sections) < 2:
+                raise ValueError("update_header requires 2 sections: file_path, header_content.")
+            file_path_arg = sections[0].strip()
+            header_content_arg = sections[1]
+            args = (file_path_arg, header_content_arg)
+            kwargs = {}
+
+        else:
+            # Fallback: pass all sections as positional strings
+            args = tuple(sections)
+            kwargs = {}
+
+        entries.append((fn, args, kwargs))
+
+    if not entries:
+        raise ValueError("No modification blocks found in file.")
+
+    return entries
+
+def main():
+    if len(sys.argv) == 2 and sys.argv[1] == 'rollback':
+        interactive_rollback()
+        return
+
+    if len(sys.argv) != 2:
+        print("Usage: python modify_code.py <modification_file>\n       python modify_code.py rollback")
+        sys.exit(1)
+
+    modification_file = sys.argv[1]
+    modifications = parse_modification_file(modification_file)
+    manager = apply_modification_set(modifications)
+    print("\nModifications complete. Use 'python modify_code.py rollback' for rollback options.")
+
+if __name__ == "__main__":
+    main()
+
+
+File: tests_code_mod/test_update_header_insertion_order.py
+#!/usr/bin/env python3
+"""
+Test to verify that declarations are never inserted before the module header.
+This ensures that when both update_header and declare operations are used,
+the header always comes first and declarations come after it.
+
+Place this in: tests_code_mod/test_update_header_insertion_order.py
+"""
+import textwrap
+from pathlib import Path
+import pytest
+from code_mod_defs import apply_modification_set, modification_description, update_header, declare
+
+
+class TestModuleHeaderInsertionOrder:
+    """Test that declarations respect module header boundaries"""
+    
+    def test_declare_after_update_header_replacement(self, tmp_path):
+        """Test that declare inserts after update_header when both are used"""
+        test_file = tmp_path / "ordering_test.py"
+        test_file.write_text(textwrap.dedent("""
+        import os
+        OLD_CONFIG = "old"
+        
+        def existing_function():
+            return "exists"
+        """).strip())
+        
+        # Apply both update_header and declare operations
+        modifications = [
+            (modification_description, ("Update header and add new function",), {}),
+            (update_header, (str(test_file), textwrap.dedent("""
+            #!/usr/bin/env python3
+            '''Modern module with enhanced configuration'''
+            import sys
+            import logging
+            from pathlib import Path
+            
+            # New configuration
+            NEW_CONFIG = "modern"
+            DEBUG = True
+            
+            # Initialize logging
+            logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO)
+            logger = logging.getLogger(__name__)
+            """).strip()), {}),
+            (declare, (str(test_file), "new_function", textwrap.dedent("""
+            def new_function():
+                '''Newly added function'''
+                logger.info("New function called")
+                return "new"
+            """).strip()), {}),
+        ]
+        
+        # Apply without git to avoid repository issues
+        update_header(str(test_file), modifications[1][1][1])
+
+        print("=== DEBUG: After update_header ===")
+        content_after_header = test_file.read_text()
+        for i, line in enumerate(content_after_header.split('\n')):
+            print(f"{i:2}: {line}")
+        declare(str(test_file), "new_function", modifications[2][1][2])  # Fixed: [2] not [1]
+        
+        content = test_file.read_text()
+        print("=== DEBUG: After declare ===")
+        for i, line in enumerate(content.split('\n')):
+            print(f"{i:2}: {line}")
+        print("=== END DEBUG ===")
+
+        lines = content.split('\n')
+        
+        # Find key elements
+        shebang_line = next((i for i, line in enumerate(lines) if line.startswith('#!/usr/bin/env python3')), -1)
+        import_sys_line = next((i for i, line in enumerate(lines) if 'import sys' in line), -1)
+        config_line = next((i for i, line in enumerate(lines) if 'NEW_CONFIG = "modern"' in line), -1)
+        logger_line = next((i for i, line in enumerate(lines) if 'logger = logging.getLogger(__name__)' in line), -1)
+        new_func_line = next((i for i, line in enumerate(lines) if 'def new_function():' in line), -1)
+        existing_func_line = next((i for i, line in enumerate(lines) if 'def existing_function():' in line), -1)
+        
+        # Verify order: shebang -> imports -> config -> logger -> new function -> existing function
+        assert shebang_line < import_sys_line, "Shebang should come before imports"
+        assert import_sys_line < config_line, "Imports should come before config"
+        assert config_line < logger_line, "Config should come before logger"
+        assert logger_line < new_func_line, "Header (logger) should come before new function"
+        assert existing_func_line < new_func_line, "Existing function should come before new function"
+        
+        # Verify old header elements are gone
+        assert "import os" not in content
+        assert "OLD_CONFIG" not in content
+        
+        # Verify new header elements are present
+        assert "#!/usr/bin/env python3" in content
+        assert "import sys" in content
+        assert "NEW_CONFIG = \"modern\"" in content
+        assert "logger = logging.getLogger(__name__)" in content
+        
+        # Verify functions are present
+        assert "def new_function():" in content
+        assert "def existing_function():" in content
+
+
+    def test_multiple_declares_after_update_header(self, tmp_path):
+        """Test multiple declare operations after update_header"""
+        test_file = tmp_path / "multi_declare.py"
+        test_file.write_text("def old_func():\n    pass\n")
+        
+        # Apply header first, then multiple declarations
+        update_header(str(test_file), textwrap.dedent("""
+        #!/usr/bin/env python3
+        '''Module with multiple new functions'''
+        import json
+        import requests
+        
+        API_BASE = "https://api.example.com"
+        TIMEOUT = 30
+        """).strip())
+        
+        declare(str(test_file), "fetch_data", textwrap.dedent("""
+        def fetch_data(endpoint):
+            '''Fetch data from API'''
+            url = f"{API_BASE}/{endpoint}"
+            response = requests.get(url, timeout=TIMEOUT)
+            return response.json()
+        """).strip())
+        
+        declare(str(test_file), "process_data", textwrap.dedent("""
+        def process_data(data):
+            '''Process API data'''
+            return {k: v for k, v in data.items() if v is not None}
+        """).strip())
+        
+        content = test_file.read_text()
+        lines = content.split('\n')
+        
+        # Find positions
+        shebang_pos = next((i for i, line in enumerate(lines) if line.startswith('#!/usr/bin/env python3')), -1)
+        api_base_pos = next((i for i, line in enumerate(lines) if 'API_BASE = ' in line), -1)
+        fetch_func_pos = next((i for i, line in enumerate(lines) if 'def fetch_data(' in line), -1)
+        process_func_pos = next((i for i, line in enumerate(lines) if 'def process_data(' in line), -1)
+        old_func_pos = next((i for i, line in enumerate(lines) if 'def old_func():' in line), -1)
+        
+        # Verify correct ordering
+        assert shebang_pos < api_base_pos, "Shebang should come before header constants"
+        assert api_base_pos < fetch_func_pos, "Header constants should come before new functions"
+        assert fetch_func_pos < process_func_pos, "Functions should be in insertion order"
+        assert old_func_pos < process_func_pos, "Existing functions should come before new functions"
+
+
+    def test_declare_insertion_respects_main_block(self, tmp_path):
+        """Test that declare inserts before __main__ block even after update_header"""
+        test_file = tmp_path / "with_main.py"
+        test_file.write_text(textwrap.dedent("""
+        import sys
+        
+        if __name__ == '__main__':
+            print("Original main")
+        """).strip())
+        
+        # Apply header and declaration
+        update_header(str(test_file), textwrap.dedent("""
+        #!/usr/bin/env python3
+        '''Application with main block'''
+        import argparse
+        import logging
+        
+        DEFAULT_LOG_LEVEL = "INFO"
+        """).strip())
+        
+        declare(str(test_file), "setup_logging", textwrap.dedent("""
+        def setup_logging(level=DEFAULT_LOG_LEVEL):
+            '''Setup application logging'''
+            logging.basicConfig(level=getattr(logging, level))
+            return logging.getLogger(__name__)
+        """).strip())
+        
+        content = test_file.read_text()
+        lines = content.split('\n')
+        
+        # Find positions
+        shebang_pos = next((i for i, line in enumerate(lines) if line.startswith('#!/usr/bin/env python3')), -1)
+        default_log_pos = next((i for i, line in enumerate(lines) if 'DEFAULT_LOG_LEVEL = ' in line), -1)
+        setup_func_pos = next((i for i, line in enumerate(lines) if 'def setup_logging(' in line), -1)
+        main_block_pos = next((i for i, line in enumerate(lines) if 'if __name__ == ' in line), -1)
+        
+        # Verify ordering
+        assert shebang_pos < default_log_pos, "Shebang should come first"
+        assert default_log_pos < setup_func_pos, "Header constants before functions"
+        assert setup_func_pos < main_block_pos, "Functions should come before __main__ block"
+        
+        # Verify __main__ block is preserved
+        assert "if __name__ == '__main__':" in content
+        assert "print(\"Original main\")" in content
+
+
+    def test_declare_never_before_imports(self, tmp_path):
+        """Test that declare never inserts before import statements"""
+        test_file = tmp_path / "import_order.py"
+        test_file.write_text("def existing():\n    pass\n")
+        
+        # Apply header with imports
+        update_header(str(test_file), textwrap.dedent("""
+        #!/usr/bin/env python3
+        # -*- coding: utf-8 -*-
+        '''Module with proper import ordering'''
+        
+        # Standard library imports
+        import os
+        import sys
+        from pathlib import Path
+        
+        # Third-party imports
+        import requests
+        import click
+        
+        # Configuration
+        CONFIG_DIR = Path.home() / '.myapp'
+        DEBUG = os.getenv('DEBUG', 'false').lower() == 'true'
+        """).strip())
+        
+        declare(str(test_file), "initialize_config", textwrap.dedent("""
+        def initialize_config():
+            '''Initialize application configuration'''
+            CONFIG_DIR.mkdir(exist_ok=True)
+            return CONFIG_DIR / 'config.json'
+        """).strip())
+        
+        content = test_file.read_text()
+        lines = content.split('\n')
+        
+        # Find critical positions
+        shebang_pos = next((i for i, line in enumerate(lines) if line.startswith('#!/usr/bin/env python3')), -1)
+        import_os_pos = next((i for i, line in enumerate(lines) if line.strip() == 'import os'), -1)
+        import_requests_pos = next((i for i, line in enumerate(lines) if line.strip() == 'import requests'), -1)
+        config_dir_pos = next((i for i, line in enumerate(lines) if 'CONFIG_DIR = ' in line), -1)
+        init_func_pos = next((i for i, line in enumerate(lines) if 'def initialize_config(' in line), -1)
+        existing_func_pos = next((i for i, line in enumerate(lines) if 'def existing():' in line), -1)
+        
+        # Verify strict ordering
+        assert shebang_pos < import_os_pos, "Shebang before imports"
+        assert import_os_pos < import_requests_pos, "Standard imports before third-party"
+        assert import_requests_pos < config_dir_pos, "Imports before configuration"
+        assert config_dir_pos < init_func_pos, "Configuration before new functions"
+        assert existing_func_pos < init_func_pos, "Existing functions before new functions"
+        
+        # Verify no function appears before any import
+        all_import_lines = [i for i, line in enumerate(lines) if line.strip().startswith('import ') or line.strip().startswith('from ')]
+        all_function_lines = [i for i, line in enumerate(lines) if 'def ' in line]
+        
+        if all_import_lines and all_function_lines:
+            last_import = max(all_import_lines)
+            first_function = min(all_function_lines)
+            assert last_import < first_function, "All imports must come before any function definitions"
+
+
+    def test_complex_interleaved_operations(self, tmp_path):
+        """Test complex sequence of update_header and declare operations"""
+        test_file = tmp_path / "complex.py"
+        test_file.write_text(textwrap.dedent("""
+        import old_module
+        OLD_SETTING = "deprecated"
+        
+        def legacy_function():
+            return "legacy"
+        """).strip())
+        
+        # Sequence: header -> declare -> declare -> header (should replace) -> declare
+        update_header(str(test_file), "import new_module\nNEW_SETTING = 'v1'")
+        
+        declare(str(test_file), "function_a", "def function_a():\n    return 'a'")
+        
+        declare(str(test_file), "function_b", "def function_b():\n    return 'b'")
+        
+        # Replace header again
+        update_header(str(test_file), textwrap.dedent("""
+        import newest_module
+        import another_module
+        NEWEST_SETTING = 'v2'
+        FINAL_CONFIG = True
+        """).strip())
+        
+        declare(str(test_file), "function_c", "def function_c():\n    return 'c'")
+        
+        content = test_file.read_text()
+
+        print("=== DEBUG: Final file content ===")
+        for i, line in enumerate(content.split('\n')):
+            print(f"{i:2}: {line}")
+        print("=== END DEBUG ===")
+
+        lines = content.split('\n')
+        
+        # Find positions
+        newest_import_pos = next((i for i, line in enumerate(lines) if 'import newest_module' in line), -1)
+        final_config_pos = next((i for i, line in enumerate(lines) if 'FINAL_CONFIG = True' in line), -1)
+        func_a_pos = next((i for i, line in enumerate(lines) if 'def function_a():' in line), -1)
+        func_b_pos = next((i for i, line in enumerate(lines) if 'def function_b():' in line), -1)
+        func_c_pos = next((i for i, line in enumerate(lines) if 'def function_c():' in line), -1)
+        legacy_pos = next((i for i, line in enumerate(lines) if 'def legacy_function():' in line), -1)
+        
+        # Verify final header comes first
+        assert newest_import_pos < final_config_pos, "Imports before config in header"
+        assert final_config_pos < func_a_pos, "Header before all functions"
+        assert final_config_pos < func_b_pos, "Header before all functions"
+        assert final_config_pos < func_c_pos, "Header before all functions"
+        assert final_config_pos < legacy_pos, "Header before all functions"
+        
+        # Verify old header elements are gone
+        assert "import old_module" not in content
+        assert "OLD_SETTING" not in content
+        assert "NEW_SETTING" not in content  # From first header replacement
+        
+        # Verify final header elements are present
+        assert "import newest_module" in content
+        assert "FINAL_CONFIG = True" in content
+        
+        # Verify all functions are present and in correct order
+        assert legacy_pos < func_a_pos < func_b_pos < func_c_pos, "Legacy function first, then new functions in declaration order"
+
+
+if __name__ == "__main__":
+    print("Run with: pytest test_update_header_insertion_order.py -v")
+
+
+File: tests_code_mod/test_declare_multi_in_new_code.py
+import textwrap
+from pathlib import Path
+import re
+
+import pytest
+from code_mod_defs import declare
+
+def _count_in_class(source: str, class_name: str, needle: str) -> int:
+    """Count occurrences of `needle` inside the lexical block of `class <class_name>:`.
+
+    This version records the indentation of the `class` line and then
+    scans subsequent lines while their leading indentation is strictly
+    greater than that class indentation. This makes it robust to nested
+    classes and indented class definitions.
+    """
+    lines = source.splitlines()
+    in_class = False
+    class_indent = 0
+    count = 0
+
+    def leading_spaces(s: str) -> int:
+        return len(s) - len(s.lstrip(' '))
+
+    class_re = re.compile(rf'^\s*class\s+{re.escape(class_name)}\b')
+
+    for line in lines:
+        if not in_class:
+            if class_re.match(line):
+                in_class = True
+                class_indent = leading_spaces(line)
+            continue
+
+        # Once in the class: consider only lines that are more indented than the class header
+        if line.strip() == '':
+            # blank lines belong to the current block; continue
+            pass
+        else:
+            indent = leading_spaces(line)
+            if indent <= class_indent:
+                # we've left the class block
+                break
+
+        if needle in line:
+            count += 1
+
+    return count
+
+
+def test_multi_declare_methods_same_base_chain(tmp_path):
+    p = tmp_path / "multi_class.py"
+    p.write_text(textwrap.dedent("""
+    class A:
+        class B:
+            pass
+    """))
+    # Provide two methods in one new_code block; target path points at the first one
+    declare(str(p), "A.B.foo", textwrap.dedent("""
+    def foo(self): 
+        return "foo"
+
+    def bar(self): 
+        return "bar"
+    """))
+    s = p.read_text()
+    # Both methods should appear inside class B
+    assert _count_in_class(s, "B", "def foo(") == 1
+    assert _count_in_class(s, "B", "def bar(") == 1
+    # Ensure only one copy at top-level
+    assert "def foo(" in s and "def bar(" in s
+    # Quick sanity that they are not duplicated
+    assert s.count("def foo(") == 1
+    assert s.count("def bar(") == 1
+
+
+def test_multi_declare_top_level_functions(tmp_path):
+    p = tmp_path / "multi_top_level.py"
+    p.write_text("")
+    declare(str(p), "alpha", textwrap.dedent("""
+    def alpha(): 
+        return 1
+
+    def beta(): 
+        return 2
+    """))
+    s = p.read_text()
+    # Both functions should be present at top-level
+    assert "def alpha(" in s
+    assert "def beta(" in s
+    assert s.count("def alpha(") == 1
+    assert s.count("def beta(") == 1
+
+
+def test_multi_declare_assignments_in_class(tmp_path):
+    p = tmp_path / "multi_assign_class.py"
+    p.write_text(textwrap.dedent("""
+    class C:
+        pass
+    """))
+    declare(str(p), "C.x", textwrap.dedent("""
+    x = 10
+
+    y = 20
+    """))
+    s = p.read_text()
+    # Both assignments should be inside class C and appear once
+    assert _count_in_class(s, "C", "x = 10") == 1
+    assert _count_in_class(s, "C", "y = 20") == 1
+    assert s.count("x = 10") == 1
+    assert s.count("y = 20") == 1
+
+
+File: tests_code_mod/test_modify_code_parser.py
+from modify_code import parse_modification_file
+
+SAMPLE = """\
+MMM modification_description MMM
+Describe the change
+@@@@@@
+MMM create_file MMM
+path/to/file.txt
+@@@@@@
+content here
+@@@@@@
+False
+@@@@@@
+MMM move_file MMM
+path/to/file.txt
+@@@@@@
+new/place.txt
+"""
+
+def test_parse_modification_file(tmp_path):
+    mfile = tmp_path / "mods.txt"
+    mfile.write_text(SAMPLE)
+    mods = parse_modification_file(str(mfile))
+    funcs = [m[0].__name__ for m in mods]
+    assert funcs == ["modification_description", "create_file", "move_file"]
+    assert mods[1][1][0].strip() == "path/to/file.txt"
+    assert mods[1][1][1].strip() == "content here"
+    assert mods[2][1][1].strip() == "new/place.txt"
+
+
+File: tests_code_mod/test_decorator.py
+#!/usr/bin/env python3
+"""
+Test case for declare function handling of decorators
+Place this in: tests_code_mod/test_declare_decorators.py
+"""
+import textwrap
+from pathlib import Path
+import pytest
+from code_mod_defs import declare
+
+
+class TestDeclareWithDecorators:
+    """Test that declare function properly handles decorated functions"""
+    
+    def test_single_decorator_function_replacement(self, tmp_path):
+        """Test replacing a function with a single decorator"""
+        test_file = tmp_path / "single_decorator.py"
+        test_file.write_text(textwrap.dedent("""
+        class MyClass:
+            @property
+            def value(self):
+                return "old value"
+        """))
+        
+        # Replace the decorated method
+        declare(str(test_file), "MyClass.value", textwrap.dedent("""
+        @property
+        def value(self):
+            return "new value"
+        """))
+        
+        content = test_file.read_text()
+        assert 'return "new value"' in content
+        assert 'return "old value"' not in content
+        assert '@property' in content
+    
+    def test_multiple_decorators_function_replacement(self, tmp_path):
+        """Test replacing a function with multiple decorators"""
+        test_file = tmp_path / "multi_decorator.py"
+        test_file.write_text(textwrap.dedent("""
+        import functools
+        
+        @functools.lru_cache(maxsize=128)
+        @staticmethod
+        def compute_value(x):
+            return x * 2
+        """))
+        
+        # Replace the multi-decorated function
+        declare(str(test_file), "compute_value", textwrap.dedent("""
+        @functools.lru_cache(maxsize=256)
+        @staticmethod  
+        def compute_value(x):
+            return x * 3
+        """))
+        
+        content = test_file.read_text()
+        assert 'return x * 3' in content
+        assert 'return x * 2' not in content
+        assert '@functools.lru_cache(maxsize=256)' in content
+        assert '@staticmethod' in content
+    
+    def test_multi_declaration_with_decorators(self, tmp_path):
+        """Test multi-declaration parsing with decorated functions"""
+        test_file = tmp_path / "multi_with_decorators.py"
+        test_file.write_text(textwrap.dedent("""
+        class Calculator:
+            pass
+        """))
+        
+        # Declare multiple functions, some with decorators
+        declare(str(test_file), "Calculator.add", textwrap.dedent("""
+        def add(self, a, b):
+            return a + b
+
+        @property
+        def precision(self):
+            return 2
+            
+        @staticmethod
+        @functools.lru_cache(maxsize=100)
+        def multiply(a, b):
+            return a * b
+        """))
+        
+        content = test_file.read_text()
+        
+        # All three functions should be present
+        assert 'def add(self, a, b):' in content
+        assert 'def precision(self):' in content  
+        assert 'def multiply(a, b):' in content
+        
+        # Decorators should be preserved
+        assert '@property' in content
+        assert '@staticmethod' in content
+        assert '@functools.lru_cache(maxsize=100)' in content
+        
+        # All should be inside the Calculator class
+        lines = content.split('\n')
+        calc_line = next(i for i, line in enumerate(lines) if 'class Calculator:' in line)
+        add_line = next(i for i, line in enumerate(lines) if 'def add(self, a, b):' in line)
+        precision_line = next(i for i, line in enumerate(lines) if 'def precision(self):' in line)
+        multiply_line = next(i for i, line in enumerate(lines) if 'def multiply(a, b):' in line)
+        
+        assert calc_line < add_line < precision_line < multiply_line
+    
+    def test_decorated_async_function(self, tmp_path):
+        """Test handling of decorated async functions"""
+        test_file = tmp_path / "async_decorator.py"
+        test_file.write_text(textwrap.dedent("""
+        import asyncio
+        
+        async def old_async_func():
+            return "old"
+        """))
+        
+        # Replace with decorated async function
+        declare(str(test_file), "old_async_func", textwrap.dedent("""
+        @asyncio.coroutine
+        async def old_async_func():
+            await asyncio.sleep(0.1)
+            return "new async"
+        """))
+        
+        content = test_file.read_text()
+        assert '@asyncio.coroutine' in content
+        assert 'async def old_async_func():' in content
+        assert 'return "new async"' in content
+        assert 'return "old"' not in content
+    
+    def test_decorator_with_complex_arguments(self, tmp_path):
+        """Test decorators with complex arguments and multiple lines"""
+        test_file = tmp_path / "complex_decorator.py"
+        test_file.write_text(textwrap.dedent("""
+        def simple_func():
+            return "simple"
+        """))
+        
+        # Replace with function having complex decorator
+        declare(str(test_file), "simple_func", textwrap.dedent("""
+        @app.route('/api/users/<int:user_id>', 
+                   methods=['GET', 'POST'],
+                   defaults={'format': 'json'})
+        @login_required
+        @cache.memoize(timeout=300)
+        def simple_func():
+            return "complex decorated"
+        """))
+        
+        content = test_file.read_text()
+        assert "@app.route('/api/users/<int:user_id>'" in content
+        assert "methods=['GET', 'POST']" in content
+        assert "@login_required" in content
+        assert "@cache.memoize(timeout=300)" in content
+        assert 'return "complex decorated"' in content
+        assert 'return "simple"' not in content
+    
+    def test_mixed_decorated_and_non_decorated_multi_declaration(self, tmp_path):
+        """Test mixing decorated and non-decorated functions in multi-declaration"""
+        test_file = tmp_path / "mixed_decorators.py"
+        test_file.write_text("")
+        
+        # Declare multiple functions, mixing decorated and plain
+        declare(str(test_file), "plain_func", textwrap.dedent("""
+        def plain_func():
+            return "plain"
+
+        @property  
+        def decorated_func(self):
+            return "decorated"
+            
+        def another_plain():
+            return "also plain"
+            
+        @staticmethod
+        @functools.wraps(lambda x: x)
+        def complex_decorated():
+            return "complex"
+        """))
+        
+        content = test_file.read_text()
+        
+        # All functions should be present
+        assert 'def plain_func():' in content
+        assert 'def decorated_func(self):' in content
+        assert 'def another_plain():' in content  
+        assert 'def complex_decorated():' in content
+        
+        # Decorators should be preserved where expected
+        assert '@property' in content
+        assert '@staticmethod' in content
+        assert '@functools.wraps' in content
+        
+        # Count function definitions to ensure no duplicates
+        assert content.count('def plain_func():') == 1
+        assert content.count('def decorated_func(self):') == 1
+        assert content.count('def another_plain():') == 1
+        assert content.count('def complex_decorated():') == 1
+    
+    def test_decorator_parsing_edge_cases(self, tmp_path):
+        """Test edge cases in decorator parsing"""
+        test_file = tmp_path / "edge_cases.py"
+        test_file.write_text("")
+        
+        # Test various decorator formats that might cause issues
+        declare(str(test_file), "edge_func", textwrap.dedent("""
+        # Comment before decorator
+        @decorator_with_underscores_123
+        def edge_func():
+            return "edge case 1"
+
+        @module.submodule.decorator(
+            arg1="value1",
+            arg2="value2"
+        )
+        def another_edge():
+            return "edge case 2"
+            
+        @lambda_decorator(lambda x: x.upper())
+        def lambda_decorated():
+            return "lambda case"
+        """))
+        
+        content = test_file.read_text()
+        
+        # All functions should be detected and present
+        assert 'def edge_func():' in content
+        assert 'def another_edge():' in content
+        assert 'def lambda_decorated():' in content
+        
+        # Decorators should be preserved
+        assert '@decorator_with_underscores_123' in content
+        assert '@module.submodule.decorator(' in content
+        assert '@lambda_decorator(lambda x: x.upper())' in content
+    
+    def test_pytest_parametrize_decorator(self, tmp_path):
+        """Test the specific pytest.mark.parametrize decorator that was failing"""
+        test_file = tmp_path / "pytest_test.py"
+        test_file.write_text("import pytest\n")
+        
+        # Test the exact decorator format that was failing
+        declare(str(test_file), "test_mdl_ordering_and_sign", textwrap.dedent("""
+        @pytest.mark.parametrize("delta", [1e-3, 1e-2, 0.1])
+        def test_mdl_ordering_and_sign(delta):
+            assert delta > 0
+            return delta * 2
+        """))
+        
+        content = test_file.read_text()
+        
+        # Function should be correctly identified and added
+        assert 'def test_mdl_ordering_and_sign(delta):' in content
+        assert '@pytest.mark.parametrize("delta", [1e-3, 1e-2, 0.1])' in content
+        assert 'assert delta > 0' in content
+    
+    def test_multiline_decorator_with_complex_args(self, tmp_path):
+        """Test decorators with complex multiline arguments"""
+        test_file = tmp_path / "multiline_decorator.py"
+        test_file.write_text("")
+        
+        # Test decorator that spans multiple lines with complex arguments
+        declare(str(test_file), "complex_test", textwrap.dedent("""
+        @pytest.mark.parametrize(
+            "input_val,expected",
+            [
+                (1, 2),
+                (2, 4),
+                (3, 6)
+            ]
+        )
+        def complex_test(input_val, expected):
+            assert input_val * 2 == expected
+
+        @app.route(
+            '/api/v1/users/<int:user_id>/profile',
+            methods=['GET', 'POST', 'PUT'],
+            defaults={'format': 'json', 'version': 'v1'}
+        )
+        @login_required
+        def user_profile_handler(user_id):
+            return {"user_id": user_id}
+        """))
+        
+        content = test_file.read_text()
+        
+        # Both functions should be correctly identified despite complex multiline decorators
+        assert 'def complex_test(input_val, expected):' in content
+        assert 'def user_profile_handler(user_id):' in content
+        assert '@pytest.mark.parametrize(' in content
+        assert '@app.route(' in content
+        assert '@login_required' in content
+        
+        # Verify no duplicates created
+        assert content.count('def complex_test(') == 1
+        assert content.count('def user_profile_handler(') == 1
+    
+    def test_decorator_name_inference_debugging(self, tmp_path):
+        """Test to debug the specific name inference logic with decorators"""
+        from code_mod_defs import declare
+        
+        # Test the internal parsing logic directly
+        test_code = textwrap.dedent("""
+        @property
+        def decorated_method(self):
+            return "test"
+
+        def plain_method(self):
+            return "plain"
+        """)
+        
+        # This should not fail when declare tries to parse multiple declarations
+        test_file = tmp_path / "debug_test.py"
+        test_file.write_text("class TestClass:\n    pass\n")
+        
+        # This call should work without errors and correctly identify both methods
+        declare(str(test_file), "TestClass.decorated_method", test_code)
+        
+        content = test_file.read_text()
+        
+        # Both methods should be added to the class
+        assert 'def decorated_method(self):' in content
+        assert 'def plain_method(self):' in content
+        assert '@property' in content
+
+
+if __name__ == "__main__":
+    print("Run with: pytest test_declare_decorators.py -v")
+
+
+File: tests_code_mod/test_apply_modification_set.py
+from pathlib import Path
+import subprocess
+import pytest
+
+from code_mod_defs import apply_modification_set, create_file, move_file, remove_file, modification_description
+
+def test_apply_modification_set_success(tmp_git_repo):
+    repo, chdir = tmp_git_repo
+    with chdir(repo):
+        Path("dst").mkdir(parents=True, exist_ok=True)
+        mods = [
+            (modification_description, ("create and move files",), {}),
+            (create_file, ("src/a.txt", "A",), {"make_executable": False}),
+            (create_file, ("src/b.txt", "B",), {"make_executable": False}),
+            (move_file, ("src/a.txt", "dst/a.txt"), {}),
+            (remove_file, ("src", True), {}),
+        ]
+        mgr = apply_modification_set(mods, auto_rollback_on_failure=True)
+        assert Path("dst/a.txt").exists()
+        assert not Path("src").exists()
+        assert mgr.rollback_data.get("commit_hash")
+
+def test_apply_modification_set_failure_rolls_back(tmp_git_repo):
+    repo, chdir = tmp_git_repo
+    with chdir(repo):
+        initial_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+
+        mods = [
+            (create_file, ("x.txt", "X",), {"make_executable": False}),
+            (move_file, ("does_not_exist.txt", "y.txt"), {}),
+        ]
+        with pytest.raises(Exception):
+            apply_modification_set(mods, auto_rollback_on_failure=True)
+
+        # HEAD should remain the same (no new commit was added)
+        head_after = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+        assert head_after == initial_commit
+
+        # The file may exist untracked; ensure it was NOT staged/committed
+        tracked = subprocess.check_output(["git", "ls-files", "x.txt"], text=True).strip()
+        assert tracked == ""
+
+
+File: tests_code_mod/test_declare_py_path_syntax.py
+# File: tests_code_mod/test_declare_py_path_syntax.py
+#!/usr/bin/env python3
+"""
+Test case for declare function's .py. path syntax
+This tests the feature where "file.py.target" can be used as a combined path
+"""
+import textwrap
+from pathlib import Path
+import pytest
+from code_mod_defs import declare
+
+
+class TestDeclareWithPyPathSyntax:
+    """Test that declare properly handles file.py.target syntax"""
+    
+    def test_simple_function_with_py_path_syntax(self, tmp_path):
+        """Test basic function declaration using file.py.function_name syntax"""
+        test_file = tmp_path / "module.py"
+        test_file.write_text(textwrap.dedent("""
+        def old_function():
+            return "old"
+        """))
+        
+        # Change to tmp_path directory for relative path to work
+        import os
+        original_dir = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            
+            # Use the combined path syntax: file.py.target
+            declare("module.py.old_function", textwrap.dedent("""
+            def old_function():
+                return "new"
+            """))
+            
+            content = test_file.read_text()
+            assert 'return "new"' in content
+            assert 'return "old"' not in content
+        finally:
+            os.chdir(original_dir)
+    
+    def test_nested_class_method_with_py_path_syntax(self, tmp_path):
+        """Test nested class method using file.py.Class.method syntax"""
+        test_file = tmp_path / "calculator.py"
+        test_file.write_text(textwrap.dedent("""
+        class Calculator:
+            def add(self, a, b):
+                return a + b
+        """))
+        
+        import os
+        original_dir = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            
+            # Use nested path: file.py.Class.method
+            declare("calculator.py.Calculator.add", textwrap.dedent("""
+            def add(self, a, b):
+                return a + b + 1  # Modified
+            """))
+            
+            content = test_file.read_text()
+            assert 'return a + b + 1' in content
+            # Check that the plain "return a + b" is gone (may still have "a + b + 1")
+            lines_with_return = [line for line in content.split('\n') if 'return' in line]
+            assert any('a + b + 1' in line for line in lines_with_return)
+            assert not any(line.strip() == 'return a + b' for line in lines_with_return)
+        finally:
+            os.chdir(original_dir)
+    
+    def test_py_path_with_subdirectory(self, tmp_path):
+        """Test that subdirectory paths work: subdir/file.py.target"""
+        subdir = tmp_path / "src"
+        subdir.mkdir()
+        test_file = subdir / "utils.py"
+        test_file.write_text(textwrap.dedent("""
+        def helper():
+            return "original"
+        """))
+        
+        import os
+        original_dir = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            
+            # Use path with subdirectory
+            declare("src/utils.py.helper", textwrap.dedent("""
+            def helper():
+                return "updated"
+            """))
+            
+            content = test_file.read_text()
+            assert 'return "updated"' in content
+            assert 'return "original"' not in content
+        finally:
+            os.chdir(original_dir)
+    
+    def test_py_path_replaces_different_function_name(self, tmp_path):
+        """Test that .py. syntax can replace a function with a different name"""
+        test_file = tmp_path / "service.py"
+        test_file.write_text(textwrap.dedent("""
+        def fetch_data():
+            return "old implementation"
+        """))
+        
+        import os
+        original_dir = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            
+            # Target is fetch_data, but new function has different name
+            declare("service.py.fetch_data", textwrap.dedent("""
+            def fetch_data_v2():
+                return "new implementation"
+            """))
+            
+            content = test_file.read_text()
+            # Old function should be replaced
+            assert 'def fetch_data():' not in content
+            assert 'def fetch_data_v2():' in content
+            assert 'return "new implementation"' in content
+        finally:
+            os.chdir(original_dir)
+    
+    def test_py_path_with_assignment(self, tmp_path):
+        """Test .py. syntax works with variable assignments"""
+        test_file = tmp_path / "config.py"
+        test_file.write_text(textwrap.dedent("""
+        API_URL = "http://old-api.example.com"
+        TIMEOUT = 30
+        """))
+        
+        import os
+        original_dir = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            
+            declare("config.py.API_URL", textwrap.dedent("""
+            API_URL = "http://new-api.example.com"
+            """))
+            
+            content = test_file.read_text()
+            assert 'http://new-api.example.com' in content
+            assert 'http://old-api.example.com' not in content
+            assert 'TIMEOUT = 30' in content  # Other vars preserved
+        finally:
+            os.chdir(original_dir)
+    
+    def test_py_path_with_class_definition(self, tmp_path):
+        """Test .py. syntax works with class definitions"""
+        test_file = tmp_path / "models.py"
+        test_file.write_text(textwrap.dedent("""
+        class OldModel:
+            def __init__(self):
+                self.version = 1
+        """))
+        
+        import os
+        original_dir = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            
+            declare("models.py.OldModel", textwrap.dedent("""
+            class OldModel:
+                def __init__(self):
+                    self.version = 2
+                    self.updated = True
+            """))
+            
+            content = test_file.read_text()
+            assert 'self.version = 2' in content
+            assert 'self.updated = True' in content
+            assert 'self.version = 1' not in content
+        finally:
+            os.chdir(original_dir)
+    
+    def test_three_arg_form_still_works(self, tmp_path):
+        """Ensure traditional 3-argument form still works"""
+        test_file = tmp_path / "legacy.py"
+        test_file.write_text(textwrap.dedent("""
+        def old_func():
+            pass
+        """))
+        
+        # Traditional 3-arg form should still work (uses absolute path)
+        declare(str(test_file), "old_func", textwrap.dedent("""
+        def old_func():
+            return "updated"
+        """))
+        
+        content = test_file.read_text()
+        assert 'return "updated"' in content
+    
+    def test_example_from_documentation(self, tmp_path):
+        """Test the exact example from the feature request"""
+        test_file = tmp_path / "heteromix_training.py"
+        test_file.write_text(textwrap.dedent("""
+        def add_artifact_cli_args(parser):
+            # Old implementation
+            return parser
+        
+        def main():
+            pass
+        """))
+        
+        import os
+        original_dir = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            
+            # This is the exact syntax from the feature request
+            declare("heteromix_training.py.add_artifact_cli_args", textwrap.dedent("""
+            def new_name_for_add_artifact_cli_args(parser):
+                '''
+                Non-invasive helper: call this where you build argparse in heteromix_training.py
+                to add the --out argument without altering other CLI.
+                '''
+                parser.add_argument(
+                    "--out",
+                    type=str,
+                    required=False,
+                    help="Directory to write Model Artifact v1. If absent, no artifact is written."
+                )
+                return parser
+            """))
+            
+            content = test_file.read_text()
+            
+            # Old function should be gone
+            assert 'def add_artifact_cli_args(parser):' not in content
+            
+            # New function should be present
+            assert 'def new_name_for_add_artifact_cli_args(parser):' in content
+            assert '--out' in content
+            assert 'Model Artifact v1' in content
+            
+            # Other functions preserved
+            assert 'def main():' in content
+        finally:
+            os.chdir(original_dir)
+    
+    def test_multiple_py_in_path_uses_first(self, tmp_path):
+        """Test that if path has multiple .py., it uses the first one"""
+        # Create nested structure
+        test_file = tmp_path / "my.py"
+        test_file.write_text(textwrap.dedent("""
+        def target():
+            return "original"
+        """))
+        
+        import os
+        original_dir = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            
+            # Edge case: what if someone has "my.py.backup.py.target"?
+            # Should split at first .py.
+            declare("my.py.target", textwrap.dedent("""
+            def target():
+                return "updated"
+            """))
+            
+            content = test_file.read_text()
+            assert 'return "updated"' in content
+        finally:
+            os.chdir(original_dir)
+
+
+if __name__ == "__main__":
+    print("Run with: pytest test_declare_py_path_syntax.py -v")
+
+File: tests_code_mod/test_declare_indented_code.py
+#!/usr/bin/env python3
+"""
+Test case for declare function handling of pre-indented code.
+Place this in: tests_code_mod/test_declare_indented_code.py
+"""
+import textwrap
+from pathlib import Path
+import pytest
+from code_mod_defs import declare
+
+
+class TestDeclareWithIndentedCode:
+    """Test that declare properly handles pre-indented code"""
+    
+    def test_method_with_leading_indentation(self, tmp_path):
+        """Test that method code with leading indentation is handled correctly"""
+        test_file = tmp_path / "test_class.py"
+        test_file.write_text(textwrap.dedent("""
+        class MyClass:
+            def old_method(self):
+                return "old"
+        """))
+        
+        # Provide code WITH indentation (as if user tried to be helpful)
+        indented_code = """    def old_method(self):
+        return "new"
+    """
+        
+        # This should work despite the indentation
+        declare(str(test_file), "MyClass.old_method", indented_code)
+        
+        content = test_file.read_text()
+        assert 'return "new"' in content
+        assert 'return "old"' not in content
+        assert 'def old_method(self):' in content
+    
+    def test_method_with_decorator_and_indentation(self, tmp_path):
+        """Test decorated method with leading indentation"""
+        test_file = tmp_path / "decorated_class.py"
+        test_file.write_text(textwrap.dedent("""
+        class Calculator:
+            def compute(self, x):
+                return x * 2
+        """))
+        
+        # Indented code with decorator (like the original bug report)
+        indented_code = """    @torch.no_grad()
+    def compute(self, x):
+        return x * 3
+    """
+        
+        declare(str(test_file), "Calculator.compute", indented_code)
+        
+        content = test_file.read_text()
+        assert '@torch.no_grad()' in content
+        assert 'return x * 3' in content
+        assert 'return x * 2' not in content
+    
+    def test_deeply_indented_method(self, tmp_path):
+        """Test method with excessive indentation (e.g., copied from nested context)"""
+        test_file = tmp_path / "nested_class.py"
+        test_file.write_text(textwrap.dedent("""
+        class Outer:
+            class Inner:
+                def method(self):
+                    return "old"
+        """))
+        
+        # Very indented code (8 spaces)
+        deeply_indented = """        def method(self):
+            return "new"
+        """
+        
+        declare(str(test_file), "Outer.Inner.method", deeply_indented)
+        
+        content = test_file.read_text()
+        assert 'return "new"' in content
+        assert 'return "old"' not in content
+    
+    def test_mixed_indentation_multi_declaration(self, tmp_path):
+        """Test multiple declarations with indentation"""
+        test_file = tmp_path / "multi_methods.py"
+        test_file.write_text(textwrap.dedent("""
+        class DataProcessor:
+            pass
+        """))
+        
+        # Multiple methods with indentation
+        indented_multi = """    def process(self, data):
+        return data.upper()
+
+    @property
+    def name(self):
+        return "processor"
+    
+    def validate(self, data):
+        return len(data) > 0
+    """
+        
+        declare(str(test_file), "DataProcessor.process", indented_multi)
+        
+        content = test_file.read_text()
+        
+        # All methods should be present
+        assert 'def process(self, data):' in content
+        assert 'def name(self):' in content
+        assert 'def validate(self, data):' in content
+        assert '@property' in content
+        assert 'return data.upper()' in content
+        assert 'return "processor"' in content
+        assert 'return len(data) > 0' in content
+    
+    def test_top_level_function_with_indentation(self, tmp_path):
+        """Test top-level function with unnecessary indentation"""
+        test_file = tmp_path / "module.py"
+        test_file.write_text(textwrap.dedent("""
+        def old_function():
+            return "old"
+        """))
+        
+        # Indented top-level function (should still work)
+        indented_func = """    def old_function():
+        return "new"
+    """
+        
+        declare(str(test_file), "old_function", indented_func)
+        
+        content = test_file.read_text()
+        assert 'return "new"' in content
+        assert 'return "old"' not in content
+    
+    def test_assignment_with_indentation(self, tmp_path):
+        """Test assignment with leading indentation"""
+        test_file = tmp_path / "config.py"
+        test_file.write_text(textwrap.dedent("""
+        class Config:
+            DEBUG = False
+        """))
+        
+        # Indented assignment
+        indented_assign = """    DEBUG = True
+    """
+        
+        declare(str(test_file), "Config.DEBUG", indented_assign)
+        
+        content = test_file.read_text()
+        assert 'DEBUG = True' in content
+        assert 'DEBUG = False' not in content
+    
+    def test_real_world_torch_example(self, tmp_path):
+        """Test the exact scenario from the bug report"""
+        test_file = tmp_path / "mdlloss_flow.py"
+        test_file.write_text(textwrap.dedent("""
+        import torch
+        
+        class MDLLossFlow:
+            def compute_gaussian_nll_bits(self, residuals):
+                # Old implementation
+                return residuals.sum()
+        """))
+        
+        # Exact code from bug report with indentation
+        indented_method = """    @torch.no_grad()
+    def compute_gaussian_nll_bits(self, residuals: torch.Tensor) -> torch.Tensor:
+        \"\"\"
+        Compute Gaussian NLL in bits for residuals.
+        Uses robust MAD-based scale estimation.
+        
+        Args:
+            residuals: [n, d] residuals in log1p space
+            
+        Returns:
+            Scalar tensor: total NLL in bits
+        \"\"\"
+        r64 = residuals.to(torch.float64)
+        
+        # Robust scale estimation per feature
+        mad = torch.median(torch.abs(r64 - torch.median(r64, dim=0).values), dim=0).values.clamp_min(1e-12)
+        sigma = 1.4826 * mad
+        sigma = torch.maximum(sigma, torch.full_like(sigma, 1e-3))
+        
+        # Gaussian NLL in bits
+        n = r64.shape[0]
+        nll_bits = 0.5 * torch.sum((r64 / sigma.unsqueeze(0))**2) / torch.log(torch.tensor(2.0, dtype=torch.float64))
+        
+        # Add normalization constant: -log2(sqrt(2π)σ) per sample per feature
+        norm_bits = n * torch.sum(0.5 * torch.log2(2.0 * torch.pi * sigma**2))
+        
+        return nll_bits + norm_bits
+    """
+        
+        # This should work now with the fix
+        declare(str(test_file), "MDLLossFlow.compute_gaussian_nll_bits", indented_method)
+        
+        content = test_file.read_text()
+        
+        # Verify the new implementation is present
+        assert '@torch.no_grad()' in content
+        assert 'def compute_gaussian_nll_bits(self, residuals: torch.Tensor) -> torch.Tensor:' in content
+        assert 'Compute Gaussian NLL in bits for residuals.' in content
+        assert 'r64 = residuals.to(torch.float64)' in content
+        assert 'mad = torch.median' in content
+        assert 'nll_bits + norm_bits' in content
+        
+        # Old implementation should be gone
+        assert 'return residuals.sum()' not in content
+        
+        # Verify it's properly indented inside the class
+        lines = content.split('\n')
+        decorator_line = next(i for i, line in enumerate(lines) if '@torch.no_grad()' in line)
+        def_line = next(i for i, line in enumerate(lines) if 'def compute_gaussian_nll_bits' in line)
+        
+        # Both should be indented (not at column 0)
+        assert lines[decorator_line].startswith('    ')
+        assert lines[def_line].startswith('    ')
+    
+    def test_tabs_and_spaces_mix(self, tmp_path):
+        """Test handling of mixed tabs and spaces (dedent handles this)"""
+        test_file = tmp_path / "mixed_indent.py"
+        test_file.write_text(textwrap.dedent("""
+        class MixedClass:
+            def method(self):
+                return "old"
+        """))
+        
+        # Code with tab indentation
+        tab_indented = "\tdef method(self):\n\t\treturn 'new'\n"
+        
+        declare(str(test_file), "MixedClass.method", tab_indented)
+        
+        content = test_file.read_text()
+        assert 'return \'new\'' in content or 'return "new"' in content
+        assert 'return "old"' not in content
+    
+    def test_no_indentation_still_works(self, tmp_path):
+        """Verify that code without indentation still works (regression test)"""
+        test_file = tmp_path / "normal.py"
+        test_file.write_text(textwrap.dedent("""
+        class NormalClass:
+            def method(self):
+                return "old"
+        """))
+        
+        # Code without any leading indentation (original expected format)
+        normal_code = """def method(self):
+    return "new"
+"""
+        
+        declare(str(test_file), "NormalClass.method", normal_code)
+        
+        content = test_file.read_text()
+        assert 'return "new"' in content
+        assert 'return "old"' not in content
+
+
+if __name__ == "__main__":
+    print("Run with: pytest test_declare_indented_code.py -v")
+
+File: tests_code_mod/test_nested_declaration_replacement.py
+#!/usr/bin/env python3
+"""
+Test to verify that nested declarations can be replaced correctly.
+This ensures that when using declare with a dotted path like 'main.foo',
+the nested function is properly replaced without affecting the outer structure.
+
+Place this in: tests_code_mod/test_nested_declaration_replacement.py
+"""
+import textwrap
+from pathlib import Path
+import pytest
+from code_mod_defs import declare
+
+
+class TestNestedDeclarationReplacement:
+    """Test replacement of nested declarations"""
+    
+    def test_replace_nested_function(self, tmp_path):
+        """Test replacing a nested function using dotted path"""
+        test_file = tmp_path / "nested_test.py"
+        test_file.write_text(textwrap.dedent("""
+        def main():
+            def foo():
+                pass
+                
+            def bar():
+                return "original"
+        """).strip())
+        
+        # Apply declare for nested replacement
+        declare(str(test_file), "main.foo", textwrap.dedent("""
+        def foo():
+            '''Updated nested function'''
+            print('hi')
+            return "updated"
+        """).strip())
+        
+        content = test_file.read_text()
+        print("=== DEBUG: After declare ===")
+        for i, line in enumerate(content.split('\n')):
+            print(f"{i:2}: {line}")
+        print("=== END DEBUG ===")
+
+        lines = content.split('\n')
+        
+        # Find key elements
+        main_def_line = next((i for i, line in enumerate(lines) if line.strip().startswith('def main():')), -1)
+        foo_def_line = next((i for i, line in enumerate(lines) if line.strip().startswith('def foo():')), -1)
+        print_line = next((i for i, line in enumerate(lines) if "print('hi')" in line), -1)
+        bar_def_line = next((i for i, line in enumerate(lines) if line.strip().startswith('def bar():')), -1)
+        pass_line = next((i for i, line in enumerate(lines) if line.strip() == 'pass'), -1)
+        
+        # Verify order: main > foo > print > bar
+        assert main_def_line < foo_def_line, "Main should come before foo"
+        assert foo_def_line < print_line, "Foo def should come before its body"
+        assert foo_def_line < bar_def_line, "Foo should come before bar"
+        
+        # Verify replacement happened
+        assert "print('hi')" in content
+        assert "return \"updated\"" in content
+        
+        # Verify original elements preserved/removed
+        assert "def bar():" in content
+        assert "return \"original\"" in content
+        assert pass_line == -1, "Original 'pass' should be removed"
+        
+        # Verify no unexpected changes
+        assert "def main():" in content
+        assert content.count('def foo():') == 1, "Only one foo definition should exist"
+
+
+    def test_replace_nested_class_method(self, tmp_path):
+        """Test replacing a method inside a nested class"""
+        test_file = tmp_path / "nested_class.py"
+        test_file.write_text(textwrap.dedent("""
+        class Outer:
+            class Inner:
+                def method(self):
+                    return "original"
+                
+            def other(self):
+                return "preserve"
+        """).strip())
+        
+        # Apply declare for nested method replacement
+        declare(str(test_file), "Outer.Inner.method", textwrap.dedent("""
+        def method(self):
+            '''Updated method'''
+            return "updated"
+        """).strip())
+        
+        content = test_file.read_text()
+        lines = content.split('\n')
+        
+        # Find positions
+        outer_line = next((i for i, line in enumerate(lines) if line.strip().startswith('class Outer:')), -1)
+        inner_line = next((i for i, line in enumerate(lines) if line.strip().startswith('class Inner:')), -1)
+        method_line = next((i for i, line in enumerate(lines) if line.strip().startswith('def method(self):')), -1)
+        updated_return_line = next((i for i, line in enumerate(lines) if 'return "updated"' in line), -1)
+        other_line = next((i for i, line in enumerate(lines) if line.strip().startswith('def other(self):')), -1)
+        
+        # Verify correct ordering
+        assert outer_line < inner_line, "Outer should come before Inner"
+        assert inner_line < method_line, "Inner should come before method"
+        assert method_line < updated_return_line, "Method def before its body"
+        assert method_line < other_line, "Method should come before other (assuming insertion order)"
+        
+        # Verify changes
+        assert 'return "updated"' in content
+        assert 'return "original"' not in content
+        assert 'def other(self):' in content
+        assert 'return "preserve"' in content
+
+
+    def test_replace_deeply_nested(self, tmp_path):
+        """Test replacement with deeper nesting like func.class.method"""
+        test_file = tmp_path / "deep_nested.py"
+        test_file.write_text(textwrap.dedent("""
+        def func():
+            class Cls:
+                def meth(self):
+                    pass
+            
+            def other():
+                return "preserve"
+        """).strip())
+        
+        # Apply declare for deep nested replacement
+        declare(str(test_file), "func.Cls.meth", textwrap.dedent("""
+        def meth(self):
+            '''Deep updated'''
+            print('deep')
+        """).strip())
+        
+        content = test_file.read_text()
+        lines = content.split('\n')
+        
+        # Find positions
+        func_line = next((i for i, line in enumerate(lines) if line.strip().startswith('def func():')), -1)
+        cls_line = next((i for i, line in enumerate(lines) if line.strip().startswith('class Cls:')), -1)
+        meth_line = next((i for i, line in enumerate(lines) if line.strip().startswith('def meth(self):')), -1)
+        print_line = next((i for i, line in enumerate(lines) if "print('deep')" in line), -1)
+        other_line = next((i for i, line in enumerate(lines) if line.strip().startswith('def other():')), -1)
+        pass_line = next((i for i, line in enumerate(lines) if line.strip() == 'pass'), -1)
+        
+        # Verify ordering
+        assert func_line < cls_line, "Func before Cls"
+        assert cls_line < meth_line, "Cls before meth"
+        assert meth_line < print_line, "Meth before print"
+        assert meth_line < other_line, "Meth before other"
+        
+        # Verify changes
+        assert "print('deep')" in content
+        assert pass_line == -1, "'pass' should be removed"
+        assert "def other():" in content
+        assert 'return "preserve"' in content
+
+
+    def test_noop_on_nonexistent_nested(self, tmp_path):
+        """Test that declare inserts if nested target doesn't exist"""
+        test_file = tmp_path / "insert_nested.py"
+        test_file.write_text(textwrap.dedent("""
+        def main():
+            pass
+        """).strip())
+        
+        # Apply declare for non-existent nested
+        declare(str(test_file), "main.foo", textwrap.dedent("""
+        def foo():
+            print('inserted')
+        """).strip())
+        
+        content = test_file.read_text()
+        lines = content.split('\n')
+        
+        main_line = next((i for i, line in enumerate(lines) if line.strip().startswith('def main():')), -1)
+        foo_line = next((i for i, line in enumerate(lines) if line.strip().startswith('def foo():')), -1)
+        print_line = next((i for i, line in enumerate(lines) if "print('inserted')" in line), -1)
+        
+        assert main_line < foo_line < print_line, "Correct insertion order"
+        assert "print('inserted')" in content
+        assert "pass" not in content  # Original pass removed or overwritten? Wait, insertion should add after.
+
+File: tests_code_mod/test_replace_all_declarations.py
+import textwrap
+from pathlib import Path
+from code_mod_defs import declare
+
+def test_declare_replaces_all_matching_declarations(tmp_path):
+    """Test that declare replaces ALL declarations with the same name, not just the first one."""
+    p = tmp_path / "multi_declarations.py"
+    
+    # Create a file with multiple functions having the same name (which is unusual but possible)
+    p.write_text(textwrap.dedent("""
+    def helper():
+        return "first helper"
+    
+    class A:
+        def method(self):
+            return 1
+    
+    def helper():
+        return "second helper"
+    
+    class B:
+        def method(self):
+            return 2
+    
+    def helper():
+        return "third helper"
+    """))
+    
+    # Replace all 'helper' functions
+    declare(str(p), "helper", textwrap.dedent("""
+    def helper():
+        return "replaced helper"
+    """))
+    
+    content = p.read_text()
+    
+    # Should have exactly one helper function with the new implementation
+    helper_count = content.count('def helper():')
+    assert helper_count == 1, f"Expected 1 helper function, found {helper_count}"
+    
+    # Should contain the new implementation
+    assert 'return "replaced helper"' in content
+    
+    # Should not contain any of the old implementations
+    assert 'return "first helper"' not in content
+    assert 'return "second helper"' not in content
+    assert 'return "third helper"' not in content
+    
+    # Other methods should be untouched
+    assert 'return 1' in content
+    assert 'return 2' in content
+
+def test_declare_replaces_all_matching_assignments(tmp_path):
+    """Test that declare replaces ALL assignments with the same name."""
+    p = tmp_path / "multi_assignments.py"
+    
+    # Create a file with multiple assignments to the same variable
+    p.write_text(textwrap.dedent("""
+    x = "first value"
+    y = "some other var"
+    x = "second value"
+    z = "another var"
+    x = "third value"
+    """))
+    
+    # Replace all 'x' assignments
+    declare(str(p), "x", "x = \"replaced value\"\n")
+    
+    content = p.read_text()
+    
+    # Should have exactly one x assignment with the new value
+    x_count = content.count('x = ')
+    assert x_count == 1, f"Expected 1 x assignment, found {x_count}"
+    
+    # Should contain the new implementation
+    assert 'x = "replaced value"' in content
+    
+    # Should not contain any of the old implementations
+    assert 'x = "first value"' not in content
+    assert 'x = "second value"' not in content
+    assert 'x = "third value"' not in content
+    
+    # Other variables should be untouched
+    assert 'y = "some other var"' in content
+    assert 'z = "another var"' in content
+
+def test_declare_replaces_all_matching_methods_in_same_class(tmp_path):
+    """Test replacing multiple methods with same name in the same class."""
+    p = tmp_path / "overloaded_methods.py"
+    
+    # Some languages allow method overloading, Python doesn't really, but test the behavior
+    p.write_text(textwrap.dedent("""
+    class Calculator:
+        def add(self, a, b):
+            return a + b
+        
+        def multiply(self, a, b):
+            return a * b
+            
+        def add(self, a, b, c):  # This would override the first add in Python
+            return a + b + c
+    """))
+    
+    # Replace all 'add' methods
+    declare(str(p), "Calculator.add", textwrap.dedent("""
+    def add(self, *args):
+        return sum(args)
+    """))
+    
+    content = p.read_text()
+    
+    # Should have exactly one add method
+    add_count = content.count('def add(')
+    assert add_count == 1, f"Expected 1 add method, found {add_count}"
+    
+    # Should contain the new implementation
+    assert 'def add(self, *args):' in content
+    assert 'return sum(args)' in content
+    
+    # Should not contain old implementations
+    assert 'def add(self, a, b):' not in content
+    assert 'def add(self, a, b, c):' not in content
+    
+    # Other methods should be untouched
+    assert 'def multiply(self, a, b):' in content
+
+File: tests_code_mod/test_remove_block.py
+from code_mod_defs import remove_block
+
+def test_remove_block_removes_all_matching_functions():
+    source = """
+def helper():
+    return "first"
+
+def other():
+    return "other"
+
+def helper():
+    return "second"
+
+def helper():
+    return "third"
+"""
+    result, removed = remove_block(source, "helper", [])
+    assert removed == True
+    assert "def helper" not in result
+    assert "def other" in result  # should keep non-matching functions
+
+def test_remove_block_removes_all_matching_assignments():
+    source = """
+x = "first value"
+y = "some other var"
+x = "second value"
+z = "another var"
+x = "third value"
+"""
+    result, removed = remove_block(source, "x", [])
+    print(f"Removed: {removed}")
+    print(f"Result:\n{result}")
+    print(f"x count: {result.count('x = ')}")
+    assert removed == True
+    assert "x =" not in result
+    assert "y =" in result  # should keep non-matching assignments
+
+
+File: tests_code_mod/test_update_header_integration.py
+#!/usr/bin/env python3
+"""
+Integration tests for update_header with the full modification system.
+Place this in: tests_code_mod/test_update_header_integration.py
+"""
+
+import textwrap
+from pathlib import Path
+import subprocess
+import pytest
+from code_mod_defs import apply_modification_set, modification_description, update_header
+
+
+class TestModuleHeaderIntegrationWithGit:
+    """Integration tests with git rollback system"""
+    
+    def test_update_header_creates_commit(self, tmp_git_repo):
+        """Test that update_header modifications create proper git commits"""
+        repo, chdir = tmp_git_repo
+        with chdir(repo):
+            # Create initial Python file
+            test_file = Path("app.py")
+            test_file.write_text(textwrap.dedent("""
+            import os
+            OLD_CONFIG = "legacy"
+            
+            def main():
+                print("Hello World")
+            """))
+            
+            # Add and commit initial version
+            subprocess.run(["git", "add", "app.py"], check=True)
+            subprocess.run(["git", "commit", "-m", "Initial app"], check=True)
+            
+            initial_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], text=True
+            ).strip()
+            
+            # Apply update_header modification
+            modifications = [
+                (modification_description, ("Modernize app header",), {}),
+                (update_header, (str(test_file), textwrap.dedent("""
+                #!/usr/bin/env python3
+                '''Modern Python application'''
+                import sys
+                import logging
+                
+                NEW_CONFIG = "modern"
+                
+                # Setup logging
+                logging.basicConfig(level=logging.INFO)
+                logger = logging.getLogger(__name__)
+                """).strip()), {}),
+            ]
+            
+            manager = apply_modification_set(modifications, auto_commit=True)
+            
+            # Verify new commit was created
+            final_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], text=True
+            ).strip()
+            
+            assert final_commit != initial_commit
+            
+            # Verify file was modified correctly
+            content = test_file.read_text()
+            assert "#!/usr/bin/env python3" in content
+            assert "NEW_CONFIG = \"modern\"" in content
+            assert "logger = logging.getLogger(__name__)" in content
+            assert "OLD_CONFIG = \"legacy\"" not in content
+            assert "def main():" in content  # Function preserved
+            
+            # Verify commit message
+            commit_msg = subprocess.check_output(
+                ["git", "log", "-1", "--pretty=format:%s"], text=True
+            ).strip()
+            assert "Modernize app header" in commit_msg
+
+
+    def test_update_header_rollback_functionality(self, tmp_git_repo):
+        """Test rollback works correctly with update_header modifications"""
+        repo, chdir = tmp_git_repo
+        with chdir(repo):
+            test_file = Path("service.py")
+            original_content = textwrap.dedent("""
+            '''Original service module'''
+            import requests
+            import json
+            
+            API_URL = "https://api.example.com"
+            TIMEOUT = 30
+            
+            def fetch_data():
+                response = requests.get(API_URL, timeout=TIMEOUT)
+                return response.json()
+            
+            if __name__ == "__main__":
+                data = fetch_data()
+                print(json.dumps(data, indent=2))
+            """)
+            
+            test_file.write_text(original_content)
+            subprocess.run(["git", "add", "service.py"], check=True)
+            subprocess.run(["git", "commit", "-m", "Original service"], check=True)
+            
+            # Apply modifications
+            modifications = [
+                (modification_description, ("Upgrade service with async support",), {}),
+                (update_header, (str(test_file), textwrap.dedent("""
+                '''Async service module with enhanced features'''
+                import asyncio
+                import aiohttp
+                import json
+                from pathlib import Path
+                import logging
+                
+                # Enhanced configuration
+                API_URL = "https://api-v2.example.com"
+                TIMEOUT = aiohttp.ClientTimeout(total=60)
+                CACHE_DIR = Path("cache")
+                
+                # Setup
+                logging.basicConfig(level=logging.DEBUG)
+                logger = logging.getLogger(__name__)
+                CACHE_DIR.mkdir(exist_ok=True)
+                """).strip()), {}),
+            ]
+            
+            manager = apply_modification_set(modifications, auto_commit=True)
+            
+            # Verify changes applied
+            content = test_file.read_text()
+            assert "import asyncio" in content
+            assert "import aiohttp" in content
+            assert "API_URL = \"https://api-v2.example.com\"" in content
+            assert "import requests" not in content
+            assert "def fetch_data():" in content  # Function preserved
+            
+            # Test rollback
+            rollback_success = manager.hard_rollback()
+            assert rollback_success
+            
+            # Verify rollback restored original state
+            restored_content = test_file.read_text()
+            assert restored_content.strip() == original_content.strip()
+            assert "import requests" in restored_content
+            assert "import asyncio" not in restored_content
+
+
+class TestModuleHeaderWithOtherModifications:
+    """Test update_header combined with other modification types"""
+    
+    def test_update_header_with_declare_modifications(self, tmp_git_repo):
+        """Test update_header combined with declare modifications"""
+        repo, chdir = tmp_git_repo
+        with chdir(repo):
+            from code_mod_defs import declare
+            
+            test_file = Path("calculator.py")
+            test_file.write_text(textwrap.dedent("""
+            import math
+            PI = 3.14159
+            
+            def add(a, b):
+                return a + b
+            
+            def multiply(a, b):
+                return a * b
+            """))
+            
+            subprocess.run(["git", "add", "calculator.py"], check=True)
+            subprocess.run(["git", "commit", "-m", "Initial calculator"], check=True)
+            
+            # Apply combined modifications
+            modifications = [
+                (modification_description, ("Enhance calculator with better precision and new functions",), {}),
+                (update_header, (str(test_file), textwrap.dedent("""
+                '''Enhanced calculator with high precision math'''
+                from decimal import Decimal, getcontext
+                import math
+                
+                # High precision configuration
+                getcontext().prec = 50
+                PI = Decimal('3.1415926535897932384626433832795028841971693993751')
+                E = Decimal('2.7182818284590452353602874713526624977572470937000')
+                """).strip()), {}),
+                (declare, (str(test_file), "subtract", textwrap.dedent("""
+                def subtract(a, b):
+                    '''Subtract b from a with high precision'''
+                    return Decimal(str(a)) - Decimal(str(b))
+                """).strip()), {}),
+                (declare, (str(test_file), "divide", textwrap.dedent("""
+                def divide(a, b):
+                    '''Divide a by b with high precision'''
+                    if b == 0:
+                        raise ValueError("Cannot divide by zero")
+                    return Decimal(str(a)) / Decimal(str(b))
+                """).strip()), {}),
+            ]
+            
+            manager = apply_modification_set(modifications, auto_commit=True)
+            
+            content = test_file.read_text()
+            
+            # Verify header changes
+            assert "from decimal import Decimal, getcontext" in content
+            assert "getcontext().prec = 50" in content
+            assert "PI = Decimal(" in content
+            assert "PI = 3.14159" not in content
+            
+            # Verify original functions preserved
+            assert "def add(a, b):" in content
+            assert "def multiply(a, b):" in content
+            
+            # Verify new functions added
+            assert "def subtract(a, b):" in content
+            assert "def divide(a, b):" in content
+            assert "Cannot divide by zero" in content
+
+
+    def test_update_header_with_file_operations(self, tmp_git_repo):
+        """Test update_header with create_file and move_file operations"""
+        repo, chdir = tmp_git_repo
+        with chdir(repo):
+            from code_mod_defs import create_file, move_file
+            
+            # Create initial structure
+            Path("old_utils.py").write_text(textwrap.dedent("""
+            import os
+            DEBUG = False
+            
+            def helper():
+                return "old helper"
+            """))
+            
+            subprocess.run(["git", "add", "old_utils.py"], check=True)
+            subprocess.run(["git", "commit", "-m", "Initial utils"], check=True)
+            
+            modifications = [
+                (modification_description, ("Restructure project with modern utilities",), {}),
+                (create_file, ("src/config.py", textwrap.dedent("""
+                '''Configuration module'''
+                from pathlib import Path
+                
+                BASE_DIR = Path(__file__).parent.parent
+                DEBUG = True
+                LOG_LEVEL = "INFO"
+                """).strip(),), {"make_executable": False}),
+                (move_file, ("old_utils.py", "src/utils.py"), {}),
+                (update_header, ("src/utils.py", textwrap.dedent("""
+                '''Modern utility functions'''
+                import logging
+                from pathlib import Path
+                from .config import DEBUG, LOG_LEVEL
+                
+                # Setup logging
+                logging.basicConfig(level=getattr(logging, LOG_LEVEL))
+                logger = logging.getLogger(__name__)
+                """).strip()), {}),
+            ]
+            
+            manager = apply_modification_set(modifications, auto_commit=True)
+            
+            # Verify file structure
+            assert Path("src/config.py").exists()
+            assert Path("src/utils.py").exists()
+            assert not Path("old_utils.py").exists()
+            
+            # Verify config file
+            config_content = Path("src/config.py").read_text()
+            assert "BASE_DIR = Path(__file__).parent.parent" in config_content
+            
+            # Verify utils file with new header
+            utils_content = Path("src/utils.py").read_text()
+            assert "from .config import DEBUG, LOG_LEVEL" in utils_content
+            assert "logger = logging.getLogger(__name__)" in utils_content
+            assert "import os" not in utils_content  # Old header gone
+            assert "def helper():" in utils_content  # Function preserved
+
+
+class TestModuleHeaderParsingIntegration:
+    """Test update_header parsing within the modification file system"""
+    
+    def test_parse_update_header_from_file(self, tmp_path):
+        """Test parsing update_header directive from modification file"""
+        from modify_code import parse_modification_file
+        
+        mod_file = tmp_path / "header_mods.txt"
+        mod_file.write_text(textwrap.dedent("""
+        MMM modification_description MMM
+        Update application header for production deployment
+        @@@@@@
+        MMM update_header MMM
+        app/main.py
+        @@@@@@
+        #!/usr/bin/env python3
+        '''Production-ready Flask application'''
+        
+        from flask import Flask, request, jsonify, g
+        from flask_cors import CORS
+        import logging
+        import os
+        import sys
+        from pathlib import Path
+        
+        # Production configuration
+        BASE_DIR = Path(__file__).parent
+        DEBUG = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
+        SECRET_KEY = os.getenv('SECRET_KEY') or 'fallback-secret-key'
+        
+        # Database configuration
+        DATABASE_URL = os.getenv('DATABASE_URL', f'sqlite:///{BASE_DIR}/app.db')
+        
+        # Initialize Flask with production settings
+        app = Flask(__name__)
+        CORS(app, origins=os.getenv('ALLOWED_ORIGINS', '*').split(','))
+        
+        app.config.update({
+            'DEBUG': DEBUG,
+            'SECRET_KEY': SECRET_KEY,
+            'DATABASE_URL': DATABASE_URL,
+            'JSON_SORT_KEYS': False
+        })
+        
+        # Production logging
+        if not DEBUG:
+            logging.basicConfig(
+                level=logging.INFO,
+                format='%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]',
+                handlers=[
+                    logging.FileHandler('app.log'),
+                    logging.StreamHandler(sys.stdout)
+                ]
+            )
+        
+        logger = logging.getLogger(__name__)
+        logger.info('Application starting in %s mode', 'DEBUG' if DEBUG else 'PRODUCTION')
+        """).strip())
+        
+        modifications = parse_modification_file(str(mod_file))
+        
+        assert len(modifications) == 2
+        
+        # First modification should be description
+        desc_func, desc_args, desc_kwargs = modifications[0]
+        assert desc_func.__name__ == "modification_description"
+        assert desc_args[0] == "Update application header for production deployment"
+        
+        # Second modification should be update_header
+        header_func, header_args, header_kwargs = modifications[1]
+        assert header_func.__name__ == "update_header"
+        assert header_args[0] == "app/main.py"
+        
+        header_content = header_args[1]
+        assert "#!/usr/bin/env python3" in header_content
+        assert "'''Production-ready Flask application'''" in header_content
+        assert "from flask_cors import CORS" in header_content
+        assert "DATABASE_URL = os.getenv('DATABASE_URL'" in header_content
+        assert "logger.info('Application starting" in header_content
+
+
+    def test_end_to_end_modification_workflow(self, tmp_git_repo, tmp_path):
+        """Complete end-to-end test using the main script workflow"""
+        repo, chdir = tmp_git_repo
+        with chdir(repo):
+            # Create initial application structure
+            app_file = Path("web_app.py")
+            app_file.write_text(textwrap.dedent("""
+            from flask import Flask
+            import os
+            
+            DEBUG = True
+            app = Flask(__name__)
+            
+            @app.route('/')
+            def home():
+                return 'Hello World'
+            
+            if __name__ == '__main__':
+                app.run(debug=DEBUG)
+            """))
+            
+            subprocess.run(["git", "add", "web_app.py"], check=True)
+            subprocess.run(["git", "commit", "-m", "Initial web app"], check=True)
+            
+            # Create modification file
+            mod_file = tmp_path / "production_upgrade.txt"
+            mod_file.write_text(textwrap.dedent("""
+            MMM modification_description MMM
+            Upgrade web application for production deployment with proper configuration
+            @@@@@@
+            MMM update_header MMM
+            web_app.py
+            @@@@@@
+            #!/usr/bin/env python3
+            '''Production Flask Web Application'''
+            
+            from flask import Flask, request, jsonify
+            import logging
+            import os
+            import sys
+            from pathlib import Path
+            
+            # Production configuration
+            BASE_DIR = Path(__file__).parent
+            DEBUG = os.getenv('DEBUG', 'false').lower() == 'true'
+            SECRET_KEY = os.getenv('SECRET_KEY', 'change-me-in-production')
+            HOST = os.getenv('HOST', '0.0.0.0')
+            PORT = int(os.getenv('PORT', 5000))
+            
+            # Initialize Flask application
+            app = Flask(__name__)
+            app.config.update({
+                'DEBUG': DEBUG,
+                'SECRET_KEY': SECRET_KEY,
+                'TESTING': False
+            })
+            
+            # Configure logging for production
+            if not DEBUG:
+                logging.basicConfig(
+                    level=logging.INFO,
+                    format='%(asctime)s %(name)s %(levelname)s: %(message)s'
+                )
+            
+            logger = logging.getLogger(__name__)
+            logger.info('Starting application in %s mode', 'DEBUG' if DEBUG else 'PRODUCTION')
+            """).strip())
+            
+            # Parse and apply modifications (simulating main script behavior)
+            from modify_code import parse_modification_file
+            
+            modifications = parse_modification_file(str(mod_file))
+            manager = apply_modification_set(modifications, auto_commit=True)
+            
+            # Verify the complete transformation
+            final_content = app_file.read_text()
+            
+            # New header elements
+            assert "#!/usr/bin/env python3" in final_content
+            assert "'''Production Flask Web Application'''" in final_content
+            assert "from flask import Flask, request, jsonify" in final_content
+            assert "BASE_DIR = Path(__file__).parent" in final_content
+            assert "SECRET_KEY = os.getenv('SECRET_KEY'," in final_content
+            assert "logger.info('Starting application" in final_content
+            
+            # Old header elements should be gone
+            assert "from flask import Flask" not in final_content or "from flask import Flask, request, jsonify" in final_content
+            assert "DEBUG = True" not in final_content
+            
+            # Original application logic preserved
+            assert "@app.route('/')" in final_content
+            assert "def home():" in final_content
+            assert "return 'Hello World'" in final_content
+            assert "if __name__ == '__main__':" in final_content
+            
+            # Verify git commit was created
+            commit_msg = subprocess.check_output(
+                ["git", "log", "-1", "--pretty=format:%s"], text=True
+            ).strip()
+            assert "Upgrade web application for production deployment" in commit_msg
+            
+            print("✓ End-to-end update_header workflow test completed successfully")
+
+
+if __name__ == "__main__":
+    print("Module Header Integration Test Suite")
+    print("Run with: pytest test_update_header_integration.py -v")
+
+
+File: tests_code_mod/missing_commit_test.py
+import subprocess
+import pytest
+from pathlib import Path
+
+from code_mod_defs import apply_modification_set, create_file, modification_description, declare
+
+def test_modifications_create_new_commit(tmp_git_repo):
+    """This test should have caught that modifications weren't being committed."""
+    repo, chdir = tmp_git_repo
+    with chdir(repo):
+        # Get initial commit
+        initial_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+        
+        # Apply modifications
+        mods = [
+            (modification_description, ("Add test file",), {}),
+            (create_file, ("test.txt", "Hello World",), {"make_executable": False}),
+        ]
+        
+        # This should create a new commit (but currently doesn't!)
+        manager = apply_modification_set(mods, auto_commit=True, commit_message="Add test file")
+        
+        # Get commit after modifications
+        final_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+        
+        # CRITICAL: This should fail with current code because no commit was made
+        assert final_commit != initial_commit, "Expected new commit to be created after modifications"
+        
+        # Verify the file was actually committed
+        committed_files = subprocess.check_output(
+            ["git", "ls-tree", "--name-only", "HEAD"], text=True
+        ).strip().split('\n')
+        assert "test.txt" in committed_files, "Modified file should be in the new commit"
+        
+        # Verify commit message
+        commit_msg = subprocess.check_output(
+            ["git", "log", "-1", "--pretty=format:%s"], text=True
+        ).strip()
+        assert commit_msg == "Add test file", f"Expected commit message 'Add test file', got '{commit_msg}'"
+
+def test_rollback_points_are_different_after_commits(tmp_git_repo):
+    """Test that successive modification runs create different rollback points."""
+    repo, chdir = tmp_git_repo
+    with chdir(repo):
+        # First modification
+        mods1 = [
+            (modification_description, ("First change",), {}),
+            (create_file, ("file1.txt", "Content 1",), {"make_executable": False}),
+        ]
+        manager1 = apply_modification_set(mods1, auto_commit=True, commit_message="First change")
+        rollback1 = manager1.rollback_data.get("commit_hash")
+        
+        # Second modification (should start from new HEAD)
+        mods2 = [
+            (modification_description, ("Second change",), {}),
+            (create_file, ("file2.txt", "Content 2",), {"make_executable": False}),
+        ]
+        manager2 = apply_modification_set(mods2, auto_commit=True, commit_message="Second change")
+        rollback2 = manager2.rollback_data.get("commit_hash")
+        
+        # Rollback points should be different because HEAD changed between runs
+        assert rollback1 != rollback2, "Rollback points should be different after commits"
+        
+        # Current HEAD should be different from both rollback points
+        current_head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+        assert current_head != rollback1, "Current HEAD should be beyond first rollback point"
+        assert current_head != rollback2, "Current HEAD should be beyond second rollback point"
+
+def test_main_script_behavior_integration(tmp_git_repo, tmp_path):
+    """Integration test that simulates the actual script usage."""
+    repo, chdir = tmp_git_repo
+    with chdir(repo):
+        # Create a modification file like the user would
+        mod_file = tmp_path / "test_mods.txt"
+        mod_file.write_text("""
+MMM modification_description MMM
+Integration test modification
+@@@@@@
+MMM create_file MMM
+integration_test.py
+@@@@@@
+def test_function():
+    return "test"
+@@@@@@
+False
+""".strip())
+        
+        # Get initial state
+        initial_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+        
+        # Simulate what the main script does
+        from modify_code import parse_modification_file
+        modifications = parse_modification_file(str(mod_file))
+        
+        # Extract description (like the fixed main() does)
+        description = "Code modifications"
+        if modifications and modifications[0][0].__name__ == 'modification_description':
+            description = modifications[0][1][0]
+        
+        # Apply with auto_commit=True (like the fixed script should do)
+        manager = apply_modification_set(modifications, auto_commit=True, commit_message=description)
+        
+        # Verify new commit was created
+        final_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+        
+        assert final_commit != initial_commit, "Script should create new commit"
+        assert Path("integration_test.py").exists(), "File should be created"
+        
+        # Verify file is committed
+        committed_files = subprocess.check_output(
+            ["git", "ls-tree", "--name-only", "HEAD"], text=True
+        ).strip().split('\n')
+        assert "integration_test.py" in committed_files, "File should be committed"
+
+
+File: tests_code_mod/conftest.py
+import os
+import sys
+import subprocess
+import tempfile
+import shutil
+import contextlib
+from pathlib import Path
+
+import pytest
+
+# Ensure the uploaded modules are importable
+PROJECT_ROOT = Path("/mnt/data")
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+@contextlib.contextmanager
+def chdir(path: Path):
+    prev = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(prev)
+
+@pytest.fixture()
+def tmp_git_repo(tmp_path, monkeypatch):
+    """Initialize a temporary git repo with configured identity and an initial commit.
+    Yields: (repo_path: Path, chdir_ctx: contextmanager)
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.check_call(["git", "init"], cwd=repo)
+    subprocess.check_call(["git", "config", "user.name", "Test User"], cwd=repo)
+    subprocess.check_call(["git", "config", "user.email", "test@example.com"], cwd=repo)
+
+    (repo / "README.md").write_text("# temp\n")
+    subprocess.check_call(["git", "add", "README.md"], cwd=repo)
+    subprocess.check_call(["git", "commit", "-m", "init"], cwd=repo)
+
+    yield repo, chdir
+
+
+File: tests_code_mod/test_insert_before_main.py
+import textwrap
+from pathlib import Path
+from code_mod_defs import declare
+
+def test_declare_inserts_before_main_block(tmp_path):
+    """Test that new declarations are inserted before if __name__ == '__main__' block."""
+    p = tmp_path / "with_main.py"
+    
+    # Create a file with existing code and a __main__ block
+    p.write_text(textwrap.dedent("""
+    import os
+    import sys
+    
+    def existing_function():
+        return "exists"
+    
+    SOME_CONSTANT = 42
+    
+    if __name__ == '__main__':
+        print("Running main")
+        existing_function()
+        sys.exit(0)
+    """))
+    
+    # Insert a new function
+    declare(str(p), "new_function", textwrap.dedent("""
+    def new_function():
+        return "new"
+    """))
+    
+    content = p.read_text()
+    lines = content.split('\n')
+    
+    # Find the positions of key elements
+    new_func_line = next(i for i, line in enumerate(lines) if 'def new_function' in line)
+    main_line = next(i for i, line in enumerate(lines) if 'if __name__ == ' in line)
+    
+    # New function should be inserted before the __main__ block
+    assert new_func_line < main_line, f"new_function at line {new_func_line} should be before __main__ at line {main_line}"
+    
+    # Verify the __main__ block is still intact
+    assert 'if __name__ == \'__main__\':' in content
+    assert 'print("Running main")' in content
+    assert 'sys.exit(0)' in content
+
+def test_declare_inserts_before_other_executable_code(tmp_path):
+    """Test that new declarations are inserted before other executable statements."""
+    p = tmp_path / "with_exec.py"
+    
+    # Create a file with functions and trailing executable code
+    p.write_text(textwrap.dedent("""
+    def existing():
+        pass
+    
+    # Some executable code at module level
+    print("Module loading")
+    result = existing()
+    print(f"Result: {result}")
+    """))
+    
+    # Insert a new function
+    declare(str(p), "new_function", textwrap.dedent("""
+    def new_function():
+        return "inserted"
+    """))
+    
+    content = p.read_text()
+    lines = content.split('\n')
+    
+    # Find positions
+    new_func_line = next(i for i, line in enumerate(lines) if 'def new_function' in line)
+    print_line = next(i for i, line in enumerate(lines) if 'print("Module loading")' in line)
+    
+    # New function should be before executable code
+    assert new_func_line < print_line, f"new_function should be inserted before executable code"
+
+def test_declare_replaces_preserves_main_block_position(tmp_path):
+    """Test that replacing a declaration doesn't move the __main__ block."""
+    p = tmp_path / "replace_with_main.py"
+    
+    p.write_text(textwrap.dedent("""
+    def target_function():
+        return "original"
+    
+    OTHER_VAR = "unchanged"
+    
+    if __name__ == '__main__':
+        print("Main block")
+        target_function()
+    """))
+    
+    # Replace the existing function
+    declare(str(p), "target_function", textwrap.dedent("""
+    def target_function():
+        return "replaced"
+    """))
+    
+    content = p.read_text()
+    lines = content.split('\n')
+    
+    # Verify replacement happened
+    assert 'return "replaced"' in content
+    assert 'return "original"' not in content
+    
+    # Verify __main__ block is still at the end
+    target_line = next(i for i, line in enumerate(lines) if 'def target_function' in line)
+    main_line = next(i for i, line in enumerate(lines) if 'if __name__ == ' in line)
+    
+    assert target_line < main_line, "Replaced function should still be before __main__ block"
+    assert 'print("Main block")' in content
+
+File: tests_code_mod/test_declare_basic.py
+import textwrap
+from pathlib import Path
+
+from code_mod_defs import declare, parse_lexical_chain, remove_declaration
+
+def test_parse_lexical_chain_top_level():
+    name, chain = parse_lexical_chain("foo")
+    assert name == "foo" and chain == []
+
+def test_parse_lexical_chain_nested():
+    name, chain = parse_lexical_chain("A.b.c")
+    assert name == "c" and chain == ["A", "b"]
+
+def test_replace_insert_delete_roundtrip(tmp_path):
+    p = tmp_path / "m.py"
+    p.write_text("")
+    # insert a top-level def
+    declare(str(p), "foo", textwrap.dedent("""
+    def foo():
+        return 1
+    """))
+    s = p.read_text()
+    assert "def foo" in s and "return 1" in s
+
+    # replace the def
+    declare(str(p), "foo", textwrap.dedent("""
+    def foo():
+        return 2
+    """))
+    s = p.read_text()
+    assert "return 2" in s and "return 1" not in s
+
+    # delete the def
+    remove_declaration(str(p), "foo")
+    s = p.read_text()
+    assert "def foo" not in s
+
+def test_nested_insertion_and_deletion(tmp_path):
+    p = tmp_path / "n.py"
+    p.write_text(textwrap.dedent("""
+    class A:
+        def b(self):
+            x = 1
+    """))
+    # insert a method c into A
+    declare(str(p), "A.c", textwrap.dedent("""
+    def c(self):
+        return 'ok'
+    """))
+    s = p.read_text()
+    assert "def c(self)" in s
+
+    # delete method b
+    remove_declaration(str(p), "A.b")
+    s = p.read_text()
+    assert "def b(" not in s
+
+def test_assignment_replace_and_delete(tmp_path):
+    p = tmp_path / "v.py"
+    p.write_text("x = 1\ny = 2\n")
+    # replace assignment to x
+    declare(str(p), "x", "x = 42\n")
+    s = p.read_text()
+    assert "x = 42" in s and "y = 2" in s
+    # delete y
+    remove_declaration(str(p), "y")
+    s = p.read_text()
+    assert "y = 2" not in s
+
+
+File: tests_code_mod/test_git_rollback_manager.py
+from pathlib import Path
+import subprocess
+
+from code_mod_defs import GitRollbackManager, create_file
+
+def test_create_rollback_points_no_changes(tmp_git_repo):
+    repo, chdir = tmp_git_repo
+    with chdir(repo):
+        mgr = GitRollbackManager()
+        info = mgr.create_rollback_point("snapshot")
+        assert "commit_hash" in info and info["was_clean"] is True
+
+def test_commit_tracked_files_and_hard_rollback(tmp_git_repo):
+    repo, chdir = tmp_git_repo
+    with chdir(repo):
+        mgr = GitRollbackManager()
+        mgr.track_file("a.txt")
+        create_file._rollback_manager = mgr  # simulate apply_modification_set attaching tracking
+        create_file("a.txt", "hello", make_executable=False)
+
+        # Create rollback point commit that includes a.txt="hello"
+        info = mgr.create_rollback_point("after create", force_commit=True)
+        commit_after = mgr.get_current_commit()
+        assert commit_after == info["commit_hash"]
+
+        # Dirty the working tree
+        Path("a.txt").write_text("changed")
+
+        # Roll back to the rollback point commit (not HEAD~1)
+        ok = mgr.hard_rollback(info["commit_hash"])
+        assert ok
+        assert Path("a.txt").read_text() == "hello"
+
+
+
+File: tests_code_mod/test_update_vs_remove_guardrails.py
+import textwrap
+from pathlib import Path
+import pytest
+
+from modify_code import parse_modification_file
+
+def _write(tmp_path, name, text):
+    p = tmp_path / name
+    p.write_text(text)
+    return p
+
+def test_update_declaration_with_trailing_blank_after_separator(tmp_path):
+    # Content section followed by a blank line, then next block header.
+    mods_text = '''MMM update_declaration MMM
+mdlloss_flow.py
+@@@@@@
+MDLLossFlow.get_mixture_optimizer
+@@@@@@
+def get_mixture_optimizer(self, lr: float = 1e-3):
+    return None
+@@@@@@
+
+MMM modification_description MMM
+ok
+'''
+    mfile = _write(tmp_path, "mods.txt", mods_text)
+    mods = parse_modification_file(str(mfile))
+    # First entry is update_declaration with 3 sections (content present)
+    assert mods[0][0].__name__ == "declare"
+    file_path, name, content = mods[0][1]
+    assert file_path == "mdlloss_flow.py"
+    assert name == "MDLLossFlow.get_mixture_optimizer"
+    assert isinstance(content, str) and content.strip().startswith("def get_mixture_optimizer")
+
+def test_update_declaration_without_content_raises(tmp_path):
+    mods_text = '''MMM update_declaration MMM
+file.py
+@@@@@@
+A.B.method
+'''
+    mfile = _write(tmp_path, "mods.txt", mods_text)
+    with pytest.raises(ValueError) as e:
+        parse_modification_file(str(mfile))
+    assert "requires a NON-empty content section" in str(e.value)
+
+def test_remove_declaration_with_content_raises(tmp_path):
+    mods_text = '''MMM remove_declaration MMM
+file.py
+@@@@@@
+A.B.method
+@@@@@@
+def should_not_be_here():
+    pass
+'''
+    mfile = _write(tmp_path, "mods.txt", mods_text)
+    with pytest.raises(ValueError) as e:
+        parse_modification_file(str(mfile))
+    assert "must NOT include a content section" in str(e.value)
+
+def test_legacy_declare_allows_empty_to_delete(tmp_path):
+    mods_text = '''MMM declare MMM
+file.py
+@@@@@@
+A.B.method
+'''
+    mfile = _write(tmp_path, "mods.txt", mods_text)
+    mods = parse_modification_file(str(mfile))
+    # Bare declare with no content => deletion (content normalized to None)
+    assert mods[0][0].__name__ == "declare"
+    file_path, name, content = mods[0][1]
+    assert content is None
+
+
+File: code_mod_defs.py
+#!/usr/bin/env python3
+"""
+Script to apply source code and filesystem modifications with git rollback support
+Usage: python modify.py
+"""
+import os
+import shutil
+import re
+import logging
+import subprocess
+import datetime
+import json
+import libcst as cst
+from typing import Optional, List, Tuple
+import ast
+
+logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
+
+import stat
+import textwrap
+
+# near other LibCST helpers
+def _target_exists(source: str, target_name: str, chain: list[str]) -> bool:
+    try:
+        mod = cst.parse_module(source)
+    except Exception:
+        return False
+
+    class _Finder(cst.CSTVisitor):
+        def __init__(self):
+            self.stack = []
+            self.found = False
+        def visit_ClassDef(self, node: cst.ClassDef) -> None:
+            self.stack.append(node.name.value)
+        def leave_ClassDef(self, node: cst.ClassDef) -> None:
+            self.stack.pop()
+        def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
+            if node.name.value == target_name and (self.stack == chain or (not chain and not self.stack)):
+                self.found = True
+        def visit_SimpleStatementLine(self, node: cst.SimpleStatementLine) -> None:
+            if len(node.body) == 1 and isinstance(node.body[0], cst.Assign):
+                for t in node.body[0].targets:
+                    if isinstance(t.target, cst.Name) and t.target.value == target_name and (self.stack == chain or (not chain and not self.stack)):
+                        self.found = True
+
+    f = _Finder()
+    mod.visit(f)
+    return f.found
+
+
+def _is_assignment_to_name(stmt: cst.CSTNode, name: str) -> bool:
+    # Match: x = ...   (within a SimpleStatementLine)
+    if not isinstance(stmt, cst.SimpleStatementLine):
+        return False
+    for small in stmt.body:
+        if isinstance(small, cst.Assign):
+            for t in small.targets:
+                tgt = t.target
+                if isinstance(tgt, cst.Name) and tgt.value == name:
+                    return True
+    return False
+
+
+class _DeletionTransformer(cst.CSTTransformer):
+    """
+    Removes a declaration at the given lexical chain.
+    - lexical_chain == []  => operate at module level
+    - lexical_chain == ["A", "B"] => operate inside class A.B
+    Deletes:
+      * FunctionDef with matching name
+      * ClassDef with matching name
+      * Assign to matching name (top-level or inside class scope)
+    """
+    def __init__(self, target_name: str, lexical_chain: List[str]):
+        self.target_name = target_name
+        self.chain = lexical_chain
+        self.class_stack: List[str] = []
+        self.removed = False
+
+    # Track the current class stack
+    def visit_ClassDef(self, node: cst.ClassDef) -> None:
+        self.class_stack.append(node.name.value)
+
+    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.CSTNode:
+        # If we are exactly inside the desired class chain, filter this class body
+        if self.class_stack == self.chain:
+            new_body = []
+            for stmt in updated_node.body.body:
+                # Remove function with matching name
+                if isinstance(stmt, cst.FunctionDef) and stmt.name.value == self.target_name:
+                    self.removed = True
+                    continue
+                # Remove assignment to matching name
+                if _is_assignment_to_name(stmt, self.target_name):
+                    self.removed = True
+                    continue
+                new_body.append(stmt)
+            updated_node = updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
+        # Pop class stack on exit
+        self.class_stack.pop()
+        return updated_node
+
+    def leave_Module(self, original_node: cst.Module, updated_node: cst.Module) -> cst.CSTNode:
+        # Only act at module level when no class chain was requested
+        if len(self.chain) == 0:
+            new_body = []
+            for stmt in updated_node.body:
+                if isinstance(stmt, cst.FunctionDef) and stmt.name.value == self.target_name:
+                    self.removed = True
+                    continue
+                if isinstance(stmt, cst.ClassDef) and stmt.name.value == self.target_name:
+                    self.removed = True
+                    continue
+                if _is_assignment_to_name(stmt, self.target_name):
+                    self.removed = True
+                    continue
+                new_body.append(stmt)
+            updated_node = updated_node.with_changes(body=new_body)
+        return updated_node
+
+def remove_block(source: str, target_name: str, lexical_chain: List[str]) -> Tuple[str, bool]:
+    """
+    Remove a function/method/assignment designated by (lexical_chain, target_name).
+    Returns: (new_source, removed_bool)
+    """
+    try:
+        mod = cst.parse_module(source)
+    except Exception:
+        # If parsing fails, do nothing
+        return source, False
+    tr = _DeletionTransformer(target_name, lexical_chain)
+    new_mod = mod.visit(tr)
+    return new_mod.code, tr.removed
+
+
+class InsertIntoContainer(cst.CSTTransformer):
+    """Insert a node into a specific container in the AST"""
+    
+    def __init__(self, node_to_insert: cst.BaseStatement, lexical_chain: List[str]):
+        self.node_to_insert = node_to_insert
+        self.lexical_chain = lexical_chain
+        self.context_stack: List[str] = []
+        self.inserted = False
+
+    def visit_ClassDef(self, node: cst.ClassDef) -> bool:
+        self.context_stack.append(node.name.value)
+        return True
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
+        self.context_stack.append(node.name.value)
+        return True
+
+    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.BaseStatement:
+        try:
+            if self._matches_insertion_point():
+                # Insert the node into this class
+                new_body = list(updated_node.body.body) + [self.node_to_insert]
+                new_suite = updated_node.body.with_changes(body=new_body)
+                self.inserted = True
+                return updated_node.with_changes(body=new_suite)
+            return updated_node
+        finally:
+            self.context_stack.pop()
+
+    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.BaseStatement:
+        try:
+            if self._matches_insertion_point():
+                # Insert the node into this function
+                new_body = list(updated_node.body.body) + [self.node_to_insert]
+                new_suite = updated_node.body.with_changes(body=new_body)
+                self.inserted = True
+                return updated_node.with_changes(body=new_suite)
+            return updated_node
+        finally:
+            self.context_stack.pop()
+
+    def _matches_insertion_point(self) -> bool:
+        """Check if current context matches where we want to insert"""
+        return self.context_stack == self.lexical_chain
+
+class GitRollbackManager:
+    """Manages git-based rollback operations for code modifications"""
+    
+    def __init__(self, rollback_file='.modification_rollback.json'):
+        self.rollback_file = rollback_file
+        self.rollback_data = {}
+        self.tracked_files = set()
+        self.accumulated_message = ""
+    
+    def accumulate_message(self, message):
+        """Accumulate message text for commit message"""
+        if self.accumulated_message:
+            self.accumulated_message += "\n" + message
+        else:
+            self.accumulated_message = message
+
+    def get_accumulated_message(self):
+        """Get and clear accumulated message"""
+        message = self.accumulated_message
+        self.accumulated_message = ""
+        return message
+
+    def has_staged_changes(self):
+        """Check if there are staged changes ready to commit"""
+        try:
+            result = subprocess.run(['git', 'diff', '--cached', '--name-only'], 
+                                  check=True, capture_output=True, text=True)
+            return bool(result.stdout.strip())
+        except subprocess.CalledProcessError:
+            return False
+    def create_rollback_point(self, message=None, force_commit=False):
+        """
+        Create a git commit as a rollback point
+        
+        Args:
+            message: Commit message (auto-generated if None)
+            force_commit: If True, commit even if no changes exist
+            
+        Returns:
+            dict: Rollback information including commit hash, branch, timestamp
+            
+        Raises:
+            RuntimeError: If rollback point cannot be created
+        """
+        if not self.is_git_repo():
+            raise RuntimeError("Not in a git repository - rollback required for file modifications")
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        if message is None:
+            message = f"Pre-modification snapshot {timestamp}"
+        
+        current_commit = self.get_current_commit()
+        current_branch = self.get_current_branch()
+        
+        if not current_commit:
+            raise RuntimeError("Failed to get current git commit hash")
+        
+        # Check git configuration
+        try:
+            subprocess.run(['git', 'config', 'user.name'], check=True, capture_output=True)
+            subprocess.run(['git', 'config', 'user.email'], check=True, capture_output=True)
+        except subprocess.CalledProcessError:
+            raise RuntimeError("Git user.name and user.email must be configured")
+        
+        # If this is the initial rollback point creation (no existing rollback data), 
+        # save current commit as the rollback point
+        is_initial_rollback = not bool(self.rollback_data.get('commit_hash'))
+        
+        if is_initial_rollback:
+            self.rollback_data = {
+                'commit_hash': current_commit,
+                'branch': current_branch,
+                'timestamp': timestamp,
+                'message': f"Initial rollback point: {message}",
+                'was_clean': True
+            }
+            self._save_rollback_data()
+            logging.info(f"Created rollback point: {current_commit}")
+        
+        # Add only tracked files to staging
+        if self.tracked_files:
+            for file_path in self.tracked_files:
+                if os.path.exists(file_path):
+                    result = subprocess.run(['git', 'add', file_path], capture_output=True)
+                    if result.returncode != 0:
+                        raise RuntimeError(f"Failed to stage file {file_path}: {result.stderr.decode()}")
+                else:
+                    # File was deleted, add it for removal
+                    result = subprocess.run(['git', 'add', file_path], capture_output=True)
+                    if result.returncode != 0:
+                        logging.warning(f"Failed to stage deleted file {file_path}: {result.stderr.decode()}")
+        
+        # Check if there are staged changes to commit
+        has_staged = self.has_staged_changes()
+        
+        if not has_staged and not force_commit:
+            logging.info("No staged changes, using current HEAD as rollback point")
+            return self.rollback_data
+        else:
+            if not has_staged:
+                # force_commit=True but no staged changes - create empty commit
+                result = subprocess.run(['git', 'commit', '--no-verify', '--allow-empty', '-m', message], capture_output=True)
+            else:
+                # Normal commit with staged changes
+                result = subprocess.run(['git', 'commit', '--no-verify', '-m', message], capture_output=True)
+            
+            if result.returncode != 0:
+                stderr_msg = result.stderr.decode().strip()
+                stdout_msg = result.stdout.decode().strip()
+                error_details = f"stderr: {stderr_msg}, stdout: {stdout_msg}" if stderr_msg or stdout_msg else "no error details provided"
+                raise RuntimeError(f"Failed to create git commit: {error_details}")
+            
+            new_commit = self.get_current_commit()
+            if not new_commit:
+                raise RuntimeError("Failed to get commit hash after successful commit")
+            
+            logging.info(f"Created commit: {new_commit}")
+            
+            # For backward compatibility: if this was the initial call AND we created a commit,
+            # return info about the new commit. Otherwise, return original rollback data.
+            if is_initial_rollback:
+                # Update rollback data to point to the new commit for compatibility
+                updated_rollback_info = {
+                    'commit_hash': new_commit,
+                    'branch': current_branch,
+                    'timestamp': timestamp,
+                    'message': message,
+                    'was_clean': False
+                }
+                self.rollback_data = updated_rollback_info
+                self._save_rollback_data()
+                return updated_rollback_info
+            else:
+                # Return original rollback point for successive calls
+                return self.rollback_data
+
+
+
+    def track_file(self, file_path):
+        """Track a file for inclusion in git commits"""
+        self.tracked_files.add(file_path)
+    
+    def is_git_repo(self):
+        """Check if current directory is a git repository"""
+        try:
+            subprocess.run(['git', 'rev-parse', '--git-dir'], 
+                         check=True, capture_output=True)
+            return True
+        except subprocess.CalledProcessError:
+            return False
+    
+    def get_current_commit(self):
+        """Get current commit hash"""
+        try:
+            result = subprocess.run(['git', 'rev-parse', 'HEAD'], 
+                                  check=True, capture_output=True, text=True)
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return None
+    
+    def get_current_branch(self):
+        """Get current branch name"""
+        try:
+            result = subprocess.run(['git', 'branch', '--show-current'], 
+                                  check=True, capture_output=True, text=True)
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return None
+    
+    def has_uncommitted_changes(self):
+        """Check if there are uncommitted changes"""
+        try:
+            result = subprocess.run(['git', 'status', '--porcelain'], 
+                                  check=True, capture_output=True, text=True)
+            return bool(result.stdout.strip())
+        except subprocess.CalledProcessError:
+            return False
+    
+    def soft_rollback(self, commit_hash=None):
+        """
+        Soft rollback - reset to commit but keep changes staged
+        Useful for temporary rollbacks where you might want to re-apply changes
+        """
+        if not commit_hash:
+            commit_hash = self.rollback_data.get('commit_hash')
+        
+        if not commit_hash:
+            logging.error("No rollback commit specified")
+            return False
+        
+        try:
+            subprocess.run(['git', 'reset', '--soft', commit_hash], 
+                         check=True, capture_output=True)
+            logging.info(f"Soft rollback to {commit_hash} - changes staged")
+            return True
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Soft rollback failed: {e}")
+            return False
+    
+    def hard_rollback(self, commit_hash=None):
+        """
+        Hard rollback - completely reset to commit, discarding all changes
+        Use when temporarily testing modifications
+        """
+        if not commit_hash:
+            commit_hash = self.rollback_data.get('commit_hash')
+        
+        if not commit_hash:
+            logging.error("No rollback commit specified")
+            return False
+        
+        try:
+            subprocess.run(['git', 'reset', '--hard', commit_hash], 
+                         check=True, capture_output=True)
+            logging.info(f"Hard rollback to {commit_hash} - all changes discarded")
+            return True
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Hard rollback failed: {e}")
+            return False
+    
+    def abandon_to_commit(self, commit_hash=None, new_branch_name=None):
+        """
+        Abandon current development line and make the rollback commit the new HEAD
+        This creates a new branch from the rollback point and switches to it
+        
+        Args:
+            commit_hash: Commit to abandon back to (uses stored rollback if None)
+            new_branch_name: Name for new branch (auto-generated if None)
+            
+        Returns:
+            str: Name of the new branch created, or None if failed
+        """
+        if not commit_hash:
+            commit_hash = self.rollback_data.get('commit_hash')
+        
+        if not commit_hash:
+            logging.error("No rollback commit specified")
+            return None
+        
+        current_branch = self.get_current_branch()
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        if new_branch_name is None:
+            new_branch_name = f"abandoned-from-{current_branch}-{timestamp}"
+        
+        try:
+            # Create new branch from the rollback commit
+            subprocess.run(['git', 'checkout', '-b', new_branch_name, commit_hash], 
+                         check=True, capture_output=True)
+            
+            logging.info(f"Abandoned development line - new branch '{new_branch_name}' created from {commit_hash}")
+            logging.info(f"Previous branch '{current_branch}' still exists if you need to reference it")
+            
+            # Update rollback data for new branch
+            self.rollback_data['abandoned_from_branch'] = current_branch
+            self.rollback_data['new_branch'] = new_branch_name
+            self._save_rollback_data()
+            
+            return new_branch_name
+            
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Failed to abandon to commit: {e}")
+            return None
+    
+    def force_reset_branch_to_commit(self, commit_hash=None, branch_name=None):
+        """
+        Force reset current or specified branch to rollback commit
+        WARNING: This destroys the commit history after the rollback point
+        
+        Args:
+            commit_hash: Commit to reset to (uses stored rollback if None)
+            branch_name: Branch to reset (current branch if None)
+        """
+        if not commit_hash:
+            commit_hash = self.rollback_data.get('commit_hash')
+        
+        if not commit_hash:
+            logging.error("No rollback commit specified")
+            return False
+        
+        current_branch = self.get_current_branch()
+        target_branch = branch_name or current_branch
+        
+        try:
+            # Switch to target branch if not already on it
+            if current_branch != target_branch:
+                subprocess.run(['git', 'checkout', target_branch], 
+                             check=True, capture_output=True)
+            
+            # Force reset to the commit
+            subprocess.run(['git', 'reset', '--hard', commit_hash], 
+                         check=True, capture_output=True)
+            
+            logging.warning(f"DESTRUCTIVE: Reset branch '{target_branch}' to {commit_hash}")
+            logging.warning("All commits after the rollback point have been permanently lost")
+            
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Force reset failed: {e}")
+            return False
+    
+    def show_rollback_options(self):
+        """Display available rollback options to user"""
+        if not self.rollback_data:
+            self._load_rollback_data()
+        
+        if not self.rollback_data:
+            logging.info("No rollback data available")
+            return
+        
+        commit_hash = self.rollback_data['commit_hash']
+        branch = self.rollback_data.get('branch', 'unknown')
+        timestamp = self.rollback_data.get('timestamp', 'unknown')
+        
+        print("\n=== ROLLBACK OPTIONS ===")
+        print(f"Rollback commit: {commit_hash}")
+        print(f"Original branch: {branch}")
+        print(f"Created at: {timestamp}")
+        print("\nAvailable actions:")
+        print("1. Soft rollback - git reset --soft (keeps changes staged)")
+        print("2. Hard rollback - git reset --hard (discards all changes)")
+        print("3. Abandon current line - creates new branch from rollback point")
+        print("4. Force reset branch - DESTRUCTIVE, permanently loses commits")
+        print("\nManual commands:")
+        print(f"  git reset --soft {commit_hash}")
+        print(f"  git reset --hard {commit_hash}")
+        print(f"  git checkout -b new-branch-name {commit_hash}")
+    
+    def _save_rollback_data(self):
+        """Save rollback data to file"""
+        try:
+            with open(self.rollback_file, 'w') as f:
+                json.dump(self.rollback_data, f, indent=2)
+        except Exception as e:
+            logging.warning(f"Could not save rollback data: {e}")
+    
+    def _load_rollback_data(self):
+        """Load rollback data from file"""
+        try:
+            if os.path.exists(self.rollback_file):
+                with open(self.rollback_file, 'r') as f:
+                    self.rollback_data = json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load rollback data: {e}")
+            self.rollback_data = {}
+
+# pip install libcst
+
+def parse_lexical_chain(target_path: str) -> tuple[str, List[str]]:
+    """
+    Parse a lexical chain like 'ClassName.method_name' or 'outer_func.inner_func'
+    
+    Args:
+        target_path: Dot-separated path like 'ClassName.method_name'
+        
+    Returns:
+        tuple: (final_target_name, list_of_container_names)
+    """
+    parts = target_path.split('.')
+    if len(parts) == 1:
+        return parts[0], []
+    
+    return parts[-1], parts[:-1]
+
+
+class ReplaceDeclaration(cst.CSTTransformer):
+    """
+    Replace a function/method/assignment designated by (lexical_chain, target_name).
+    Supports:
+      - Module-level def/assign
+      - Method/assign inside a class chain like A.B (self.chain == ["A","B"])
+    """
+    def __init__(self, target_name: str, lexical_chain: List[str], new_code: str, kind: Optional[str] = None):
+        self.target_name = target_name
+        self.chain = lexical_chain or []
+        self.new_code = new_code
+        self.kind = kind
+        self.class_stack: List[str] = []
+        self.replaced = False  # <-- add this
+
+        try:
+            self._replacement_module = cst.parse_module(self.new_code)
+        except Exception:
+            self._replacement_module = None
+
+    # ---- context tracking for lexical chain ----
+    def visit_ClassDef(self, node: cst.ClassDef) -> None:
+        self.class_stack.append(node.name.value)
+
+    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.CSTNode:
+        # Replace methods/assignments inside the matched class chain is handled in the leaf visitors
+        self.class_stack.pop()
+        return updated_node
+
+    def _matches_lexical_chain(self) -> bool:
+        # For module-level targets, require we are NOT inside any class
+        if not self.chain:
+            return len(self.class_stack) == 0
+        # For nested class targets, require the current stack equals the chain
+        return self.class_stack == self.chain
+
+    # ---- helpers to extract replacement nodes from new_code ----
+    def _first_funcdef(self) -> Optional[cst.FunctionDef]:
+        if not self._replacement_module:
+            return None
+        for stmt in self._replacement_module.body:
+            if isinstance(stmt, cst.FunctionDef):
+                return stmt
+        return None
+
+    def _first_assign_stmtline(self) -> Optional[cst.SimpleStatementLine]:
+        if not self._replacement_module:
+            return None
+        for stmt in self._replacement_module.body:
+            if isinstance(stmt, cst.SimpleStatementLine) and stmt.body and isinstance(stmt.body[0], cst.Assign):
+                return stmt
+        return None
+
+    # ---- replacements ----
+    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.CSTNode:
+        # Replace a function (module-level or method) if names and lexical chain match
+        if self.kind in (None, "func", "def"):
+            if original_node.name.value == self.target_name and self._matches_lexical_chain():
+                rep = self._first_funcdef()
+                if rep is not None:
+                    return rep
+        return updated_node
+
+    def leave_SimpleStatementLine(self, original_node: cst.SimpleStatementLine, updated_node: cst.SimpleStatementLine) -> cst.BaseStatement:
+        if self.kind in (None, "assign"):
+            if len(updated_node.body) == 1 and isinstance(updated_node.body[0], cst.Assign):
+                assign_node = updated_node.body[0]
+                for tgt in assign_node.targets:
+                    if isinstance(tgt.target, cst.Name) and tgt.target.value == self.target_name:
+                        if self._matches_lexical_chain():
+                            rep = self._first_assign_stmtline()
+                            if rep is not None:
+                                self.replaced = True  # <-- set
+                                return rep
+        return updated_node
+
+
+def insert_block(content: str,
+                 new_code: str,
+                 target_name: Optional[str] = None,
+                 lexical_chain: Optional[List[str]] = None) -> str:
+    """
+    Insert a function or class into content at the appropriate location.
+    For top-level insertions, places before any executable code like if __name__ == '__main__'.
+
+    Args:
+        content: Source code content
+        new_code: New function/class code to insert
+        target_name: Name of the function/class to insert
+        lexical_chain: Container hierarchy for nested insertion
+
+    Returns:
+        Modified content with inserted code
+    """
+    # Parse the new code to determine what we're inserting
+    mod = cst.parse_module(new_code)
+    if len(mod.body) != 1:
+        raise ValueError("new_code must contain exactly one top-level def/class.")
+
+    node = mod.body[0]
+
+    module = cst.parse_module(content)
+
+    if not lexical_chain:
+        # Top-level insertion - find the right place before executable code
+        
+        # Find the insertion point before executable statements
+        insertion_index = len(module.body)  # Default to end
+        
+        for i, stmt in enumerate(module.body):
+            # Check if this statement is executable code that should come after declarations
+            if _is_executable_statement(stmt):
+                insertion_index = i
+                break
+        
+        # Insert at the found position
+        new_body = list(module.body)
+        new_body.insert(insertion_index, node)
+        new_module = module.with_changes(body=new_body)
+    else:
+        # Nested insertion - insert into specific container
+        transformer = InsertIntoContainer(node, lexical_chain)
+        new_module = module.visit(transformer)
+        
+        if not transformer.inserted:
+            raise ValueError(f"Could not find container {'.'.join(lexical_chain)} for insertion")
+
+    return new_module.code
+
+def _is_executable_statement(stmt: cst.BaseStatement) -> bool:
+    """
+    Check if a statement is executable code that should come after declarations.
+    Returns True for if __name__ == '__main__' blocks and other executable statements.
+    """
+    # Check for if __name__ == '__main__' pattern
+    if isinstance(stmt, cst.If):
+        test = stmt.test
+        if isinstance(test, cst.Comparison):
+            left = test.left
+            if (isinstance(left, cst.Name) and left.value == "__name__" and
+                len(test.comparisons) == 1):
+                comp = test.comparisons[0]
+                if (isinstance(comp.operator, cst.Equal) and
+                    isinstance(comp.comparator, cst.SimpleString) and
+                    comp.comparator.value in ("'__main__'", '"__main__"')):
+                    return True
+    
+    # Check for other executable statements at module level
+    if isinstance(stmt, cst.SimpleStatementLine):
+        for substmt in stmt.body:
+            # Skip module docstrings
+            if isinstance(substmt, cst.Expr) and isinstance(substmt.value, cst.SimpleString):
+                continue
+            # Skip common module setup function calls that are part of configuration
+            elif isinstance(substmt, cst.Expr) and isinstance(substmt.value, cst.Call):
+                if isinstance(substmt.value.func, cst.Attribute):
+                    # Allow common setup patterns like logging.basicConfig(), os.environ.update(), etc.
+                    attr_name = substmt.value.func.attr.value
+                    if attr_name in ("basicConfig", "getLogger", "configure", "setup", "init"):
+                        continue
+                # Skip bare function calls that look like setup
+                elif isinstance(substmt.value.func, cst.Name):
+                    func_name = substmt.value.func.value
+                    if func_name in ("setup", "configure", "init", "initialize"):
+                        continue
+                # Other function calls are considered executable
+                return True
+            # Other bare expressions (not assignments or setup calls) are executable
+            elif isinstance(substmt, cst.Expr):
+                return True
+    
+    # Other control flow that's typically executable
+    if isinstance(stmt, (cst.For, cst.While, cst.Try, cst.With)):
+        return True
+        
+    return False
+
+def _contains_function_call(node: cst.BaseExpression) -> bool:
+    """Check if an expression contains a function call."""
+    if isinstance(node, cst.Call):
+        return True
+    
+    # Recursively check compound expressions
+    if hasattr(node, 'left') and hasattr(node, 'right'):
+        return (_contains_function_call(node.left) if hasattr(node.left, 'left') or isinstance(node.left, cst.Call) else False) or \
+               (_contains_function_call(node.right) if hasattr(node.right, 'left') or isinstance(node.right, cst.Call) else False)
+    
+    return False
+
+def move_file(src, dst):
+    """Move/rename file or directory"""
+    # Track both source and destination for git operations
+    if hasattr(move_file, '_rollback_manager'):
+        move_file._rollback_manager.track_file(src)
+        move_file._rollback_manager.track_file(dst)
+    
+    shutil.move(src, dst)
+    logging.debug(f"Moved {src} to {dst}")
+
+def make_directory(path):
+    """Create directory"""
+    os.makedirs(path, exist_ok=True)
+    logging.debug(f"Created directory {path}")
+
+def remove_file(path, recursive=False):
+    """Remove file or directory"""
+    # Track file for git operations before removal
+    if hasattr(remove_file, '_rollback_manager'):
+        remove_file._rollback_manager.track_file(path)
+    
+    if recursive and os.path.isdir(path):
+        shutil.rmtree(path)
+        logging.debug(f"Removed directory {path} recursively")
+    elif os.path.isfile(path) or os.path.islink(path):
+        os.remove(path)
+        logging.debug(f"Removed file {path}")
+    elif os.path.isdir(path):
+        os.rmdir(path)
+        logging.debug(f"Removed empty directory {path}")
+    else:
+        logging.info(f"Path {path} perhaps already removed.")
+
+def modification_description(description_text):
+    """
+    Add description text to the accumulated commit message
+    
+    Args:
+        description_text: Text to append to commit message
+    """
+    if hasattr(modification_description, '_rollback_manager'):
+        modification_description._rollback_manager.accumulate_message(description_text)
+    
+# Interactive rollback interface
+def interactive_rollback():
+    """Interactive interface for rollback operations"""
+    manager = GitRollbackManager()
+    manager._load_rollback_data()
+    
+    if not manager.rollback_data:
+        print("No rollback data found")
+        return
+    
+    manager.show_rollback_options()
+    
+    while True:
+        choice = input("\nEnter choice (1-4, or 'q' to quit): ").strip()
+        
+        if choice == 'q':
+            break
+        elif choice == '1':
+            manager.soft_rollback()
+            break
+        elif choice == '2':
+            manager.hard_rollback()
+            break
+        elif choice == '3':
+            branch_name = input("New branch name (or press Enter for auto): ").strip()
+            if not branch_name:
+                branch_name = None
+            manager.abandon_to_commit(new_branch_name=branch_name)
+            break
+        elif choice == '4':
+            confirm = input("WARNING: This will permanently lose commits! Type 'yes' to confirm: ")
+            if confirm.lower() == 'yes':
+                manager.force_reset_branch_to_commit()
+                break
+        else:
+            print("Invalid choice")
+
+def open_with_mkdir(filepath, mode='w', **kwargs):
+    """
+    Opens a file at the given filepath, creating any necessary intermediate directories if they don't exist.
+    
+    Args:
+    filepath (str): The path to the file to open.
+    mode (str): The mode in which to open the file (default: 'w' for write).
+    **kwargs: Additional keyword arguments to pass to the built-in open() function.
+    
+    Returns:
+    file: An open file object.
+    
+    Example:
+    >>> with open_with_mkdir('path/to/new/dir/file.txt', 'w') as f:
+    ...     f.write('Hello, world!')
+    """
+    # Extract the directory from the filepath
+    directory = os.path.dirname(filepath)
+    
+    # Create the directory if it doesn't exist
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    
+    # Open and return the file object
+    return open(filepath, mode=mode, **kwargs)
+
+def replace_file_contents(file_path, file_content, make_executable=False):
+    if os.path.exists(file_path):
+        remove_file(file_path)
+    create_file(file_path, file_content, make_executable=make_executable)
+
+def create_file(file_path, file_content, make_executable=True):
+    """Create a file
+    
+    Args:
+        file_path: Path where script should be created
+        file_content: Content of the script
+        make_executable: If True, set executable permissions (Unix/Linux/Mac)
+    """
+    
+    #with open(file_path, 'w') as f:
+    with open_with_mkdir(file_path, 'w') as f:
+        f.write(file_content)
+    
+    if make_executable:
+        # Add executable permissions for owner, group, and others
+        current_permissions = os.stat(file_path).st_mode
+        os.chmod(file_path, current_permissions | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    
+    # Track file for git operations
+    if hasattr(create_file, '_rollback_manager'):
+        create_file._rollback_manager.track_file(file_path)
+    
+    logging.debug(f"Created {'executable script' if make_executable else 'file'} {file_path}")
+
+
+"""
+Addition to code_mod_defs.py to support update_header modifications
+This adds the ability to modify the module header section of Python files
+"""
+
+
+def update_header(file_path: str, header_content: str):
+    """
+    Replace or set the module header section of a Python file.
+    The module header includes everything before the first class or function definition:
+    - Shebang line
+    - Encoding declarations  
+    - Module docstring
+    - Import statements
+    - Module-level constants and variables
+    - Any initial setup code that runs on import
+    
+    Args:
+        file_path: Path to the Python file to modify
+        header_content: New header content to replace existing header
+    """
+    # Track file for git operations
+    if hasattr(update_header, '_rollback_manager'):
+        update_header._rollback_manager.track_file(file_path)
+    
+    with open(file_path, 'r') as f:
+        content = f.read()
+    
+    new_content = replace_update_header(content, header_content)
+    
+    with open(file_path, 'w') as f:
+        f.write(new_content)
+
+
+def replace_update_header(content: str, new_header: str) -> str:
+    """
+    Replace the module header section with new content.
+    
+    Args:
+        content: Original Python file content
+        new_header: New header content to insert
+        
+    Returns:
+        Modified file content with new header
+    """
+    try:
+        module = cst.parse_module(content)
+    except Exception as e:
+        # If CST parsing fails, fall back to regex-based approach
+        return _replace_header_regex_fallback(content, new_header)
+    
+    # Find the first class or function definition
+    first_def_index = None
+    main_block_index = None
+    
+    for i, stmt in enumerate(module.body):
+        # Check for class or function definitions
+        if isinstance(stmt, (cst.FunctionDef, cst.ClassDef)):
+            if first_def_index is None:
+                first_def_index = i
+                break
+        
+        # Check for if __name__ == '__main__' block
+        if isinstance(stmt, cst.If) and _is_main_block(stmt):
+            if main_block_index is None:
+                main_block_index = i
+    
+    # Determine where to split: before first def/class, or before __main__ if no defs
+    split_index = first_def_index if first_def_index is not None else main_block_index
+    
+    # Extract shebang and encoding lines from new_header before CST parsing
+    new_header_lines = new_header.splitlines()
+    shebang_lines = []
+    parseable_lines = []
+    
+    for line in new_header_lines:
+        stripped = line.strip()
+        if (stripped.startswith('#!') or 
+            (stripped.startswith('#') and ('coding:' in stripped or 'coding=' in stripped))):
+            shebang_lines.append(line)
+        else:
+            parseable_lines.append(line)
+    
+    parseable_header = '\n'.join(parseable_lines)
+    
+    # Parse the parseable portion of new header
+    try:
+        if parseable_header.strip():
+            new_header_module = cst.parse_module(parseable_header)
+            new_header_stmts = new_header_module.body
+        else:
+            new_header_stmts = []
+    except Exception:
+        # If new header doesn't parse, treat as raw text and try to preserve structure
+        return _replace_header_with_raw_text(content, new_header, split_index)
+    
+    if split_index is None:
+        # No functions, classes, or __main__ block - replace entire file with header
+        result_code = cst.Module(body=new_header_stmts).code
+    else:
+        # Keep everything from split_index onwards, replace everything before
+        remaining_stmts = module.body[split_index:]
+        new_body = list(new_header_stmts) + list(remaining_stmts)
+        result_code = cst.Module(body=new_body).code
+    
+    # Prepend shebang and encoding lines if any
+    if shebang_lines:
+        shebang_text = '\n'.join(shebang_lines) + '\n'
+        result_code = shebang_text + result_code
+    
+    return result_code
+
+
+def _is_main_block(stmt: cst.If) -> bool:
+    """Check if an If statement is a __name__ == '__main__' block"""
+    test = stmt.test
+    if isinstance(test, cst.Comparison):
+        left = test.left
+        if (isinstance(left, cst.Name) and left.value == "__name__" and
+            len(test.comparisons) == 1):
+            comp = test.comparisons[0]
+            if (isinstance(comp.operator, cst.Equal) and
+                isinstance(comp.comparator, cst.SimpleString) and
+                comp.comparator.value in ("'__main__'", '"__main__"')):
+                return True
+    return False
+
+
+def _replace_header_regex_fallback(content: str, new_header: str) -> str:
+    """
+    Fallback method using regex when CST parsing fails.
+    This is less precise but handles malformed Python files.
+    """
+    lines = content.splitlines(keepends=True)
+    
+    # Find first function or class definition
+    first_def_line = None
+    main_block_line = None
+    
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        
+        # Look for function or class definitions at start of line (no indentation)
+        if re.match(r'^(def|class)\s+\w+', stripped):
+            if first_def_line is None:
+                first_def_line = i
+                break
+        
+        # Look for __main__ block
+        if re.match(r"^if\s+__name__\s*==\s*['\"]__main__['\"]", stripped):
+            if main_block_line is None:
+                main_block_line = i
+    
+    # Determine split point
+    split_line = first_def_line if first_def_line is not None else main_block_line
+    
+    if split_line is None:
+        # No functions, classes, or __main__ - replace entire file
+        return new_header
+    else:
+        # Replace header section, keep the rest
+        remaining_content = ''.join(lines[split_line:])
+        return new_header + remaining_content
+
+
+def _replace_header_with_raw_text(content: str, new_header: str, split_index: Optional[int]) -> str:
+    """Handle case where new_header doesn't parse as valid Python"""
+    if split_index is None:
+        return new_header
+    
+    try:
+        module = cst.parse_module(content)
+        remaining_stmts = module.body[split_index:]
+        remaining_code = cst.Module(body=remaining_stmts).code
+        return new_header + remaining_code
+    except Exception:
+        # Complete fallback to text manipulation
+        return _replace_header_regex_fallback(content, new_header)
+
+# Example usage in modification file format:
+"""
+MMM update_header MMM
+path/to/file.py
+@@@@@@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+\"\"\"
+Updated module docstring explaining what this module does.
+\"\"\"
+
+import os
+import sys
+from pathlib import Path
+from typing import List, Dict, Optional
+
+# Updated module constants
+VERSION = "2.0.0"
+DEBUG = True
+CONFIG_PATH = "/etc/myapp/config.yaml"
+
+# Module initialization
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+"""
+
+def apply_modification_set(modifications, auto_rollback_on_failure=True, auto_commit=None, commit_message=None):
+    """
+    Apply a set of modifications with rollback support
+    
+    Args:
+        modifications: List of (function, args, kwargs) tuples
+        auto_rollback_on_failure: If True, automatically rollback on any failure
+        auto_commit: If True, force commit even if no files tracked. If None, use existing logic.
+        commit_message: Override commit message. If None, use accumulated descriptions.
+        
+    Returns:
+        GitRollbackManager: Manager instance for manual rollback operations
+        
+    Raises:
+        RuntimeError: If rollback capability cannot be established
+    """
+    rollback_manager = GitRollbackManager()
+    
+    # Set rollback manager on modification functions
+    declare._rollback_manager = rollback_manager
+    move_file._rollback_manager = rollback_manager
+    remove_file._rollback_manager = rollback_manager
+    create_file._rollback_manager = rollback_manager
+    modification_description._rollback_manager = rollback_manager
+    update_header._rollback_manager = rollback_manager
+
+    # Create rollback point - this will raise if it fails
+    rollback_info = rollback_manager.create_rollback_point("Before LLM modifications")
+    
+    # Process modifications and build commit message
+    accumulated_descriptions = []
+    other_modifications = []
+    for func, args, kwargs in modifications:
+        if func == modification_description:
+            accumulated_descriptions.append(args[0])
+        else:
+            other_modifications.append((func, args, kwargs))
+    
+    # Set accumulated message from all descriptions
+    if accumulated_descriptions:
+        full_description = "\n".join(accumulated_descriptions)
+        rollback_manager.accumulate_message(full_description)
+    
+    try:
+        # Apply all non-description modifications
+        for func, args, kwargs in other_modifications:
+            print(func.__name__)
+            func(*args, **kwargs)
+        
+        # Determine if we should commit
+        should_commit = False
+        if auto_commit is True:
+            should_commit = True
+        elif auto_commit is None and rollback_manager.tracked_files:
+            should_commit = True
+        
+        # Create final commit if needed
+        if should_commit:
+            final_commit_message = commit_message
+            if not final_commit_message:
+                final_commit_message = rollback_manager.get_accumulated_message()
+            if not final_commit_message:
+                final_commit_message = "After LLM modifications"
+            
+            rollback_manager.create_rollback_point(final_commit_message, force_commit=True)
+        
+        logging.info("All modifications completed successfully")
+        rollback_manager.show_rollback_options()
+        return rollback_manager
+        
+    except Exception as e:
+        logging.error(f"Modifications failed: {e}")
+        
+        if auto_rollback_on_failure:
+            logging.info("Auto-rolling back due to failure...")
+            success = rollback_manager.hard_rollback()
+            if success:
+                logging.info("Rollback completed successfully")
+            else:
+                logging.error("Rollback failed - manual intervention may be required")
+        else:
+            logging.info("Manual rollback available - use returned manager")
+            rollback_manager.show_rollback_options()
+        
+        raise
+    finally:
+        # Clean up rollback manager references
+        if hasattr(declare, '_rollback_manager'):
+            del declare._rollback_manager
+        if hasattr(move_file, '_rollback_manager'):
+            del move_file._rollback_manager
+        if hasattr(remove_file, '_rollback_manager'):
+            del remove_file._rollback_manager
+        if hasattr(create_file, '_rollback_manager'):
+            del create_file._rollback_manager
+        if hasattr(modification_description, '_rollback_manager'):
+            del modification_description._rollback_manager
+        if hasattr(update_header, '_rollback_manager'):
+            del update_header._rollback_manager
+
+# Helper: Use AST to properly identify top-level declarations
+def _add_parent_refs(node, parent=None):
+    node.parent = parent
+    for child in ast.iter_child_nodes(node):
+        _add_parent_refs(child, node)
+
+def _extract_declarations_with_parents(src: str):
+    try:
+        tree = ast.parse(src)
+        _add_parent_refs(tree)
+    except SyntaxError as e:
+        logging.warning(f"declare(): Could not parse new_code as valid Python: {e}")
+        return []
+    
+    decls = []
+    
+    # Only look at direct children of the module
+    for node in tree.body:
+        name = None
+        start_line = node.lineno
+        
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = node.name
+            # Include decorators in the start line
+            if node.decorator_list:
+                start_line = node.decorator_list[0].lineno
+        elif isinstance(node, ast.ClassDef):
+            name = node.name
+            # Include decorators in the start line  
+            if node.decorator_list:
+                start_line = node.decorator_list[0].lineno
+        elif isinstance(node, ast.Assign):
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                name = node.targets[0].id
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                name = node.target.id
+        
+        if name and hasattr(node, 'end_lineno'):
+            end_line = node.end_lineno or node.lineno
+            decls.append((name, start_line, end_line))
+    
+    # Extract code text for each declaration
+    lines = src.splitlines()
+    result = []
+    for name, start_line, end_line in decls:
+        start_idx = start_line - 1
+        end_idx = end_line
+        
+        if start_idx >= 0 and end_idx <= len(lines):
+            code_lines = lines[start_idx:end_idx]
+            code_text = '\n'.join(code_lines)
+            if not code_text.endswith('\n'):
+                code_text += '\n'
+            result.append((name, code_text))
+    
+    return result
+
+def remove_declaration(file_path: str, target_path: str) -> None:
+    """
+    Strictly REMOVE a function/class/assignment designated by target_path from file_path.
+    - No replacement is allowed here (use declare() for additions/updates).
+    - Raises ValueError if the target is not found.
+
+    Args:
+        file_path: Path to the Python source file to modify
+        target_path: Dotted lexical path like "ClassName.method_name" or "CONST_NAME"
+    """
+    # Track file for git operations BEFORE modifying it
+    if hasattr(remove_declaration, '_rollback_manager'):
+        remove_declaration._rollback_manager.track_file(file_path)
+
+    with open(file_path, 'r') as f:
+        content = f.read()
+
+    target_name, lexical_chain = parse_lexical_chain(target_path)
+
+    new_content, removed = remove_block(content, target_name, lexical_chain)
+    if not removed:
+        error_msg = (
+            f"remove_declaration(): target '{target_name}' not found at "
+            f"{'.'.join(lexical_chain) or '<module>'} in {file_path}"
+        )
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+
+    with open(file_path, 'w') as f:
+        f.write(new_content)
+
+
+def declare(file_path, target_path, new_code=None):
+    """
+    Declare/Update a function, class, or assignment in a file with lexical-chain support.
+
+    IMPORTANT:
+      * This function NOW REQUIRES NON-EMPTY CODE. If you want to delete, call remove_declaration().
+      * "Empty in any sense" means:
+          - new_code is None
+          - new_code is all whitespace after dedent
+          - new_code parses to an empty module (e.g., only comments/blank lines)
+          - auto-detected code from target_path is empty by the same criteria
+
+    Extended behaviors (unchanged):
+      - If target_path looks like code (contains 'def', 'class', '=', or 'async def'),
+        we treat target_path as the declaration and auto-extract the name.
+      - If new_code has multiple declarations, they are applied at the same lexical base path.
+
+    Args:
+        file_path: Path to the file to modify
+        target_path: Dotted path like "ClassName.method" OR the actual code (see above)
+        new_code: Code to insert (optional if target_path contains the code)
+    """
+    # Handle combined path "file.py.Class.method" convenience
+    if '.py.' in file_path:
+        py_index = file_path.index('.py.')
+        actual_file_path = file_path[:py_index + 3]
+        remaining_path = file_path[py_index + 4:]
+        if target_path and any(kw in target_path for kw in ['def ', 'class ', '= ', 'async def ']):
+            new_code = target_path
+            target_path = remaining_path
+            file_path = actual_file_path
+            logging.info(f"Extracted filepath '{file_path}' and target '{target_path}' from combined path")
+        else:
+            target_path = remaining_path
+            file_path = actual_file_path
+            logging.info(f"Extracted filepath '{file_path}' and target '{target_path}' from combined path")
+
+    # If caller passed the declaration in target_path, auto-extract the name
+    if new_code is None and target_path and any(kw in target_path for kw in ['def ', 'class ', '= ', 'async def ']):
+        dedented_code = textwrap.dedent(target_path)
+        if dedented_code.strip() == "":
+            raise ValueError("declare(): empty code detected (after dedent). Use remove_declaration() for deletions.")
+        try:
+            tree = ast.parse(dedented_code)
+            if not getattr(tree, "body", None):  # empty module => only comments/whitespace
+                raise ValueError("declare(): code parses to an empty module (likely only comments/whitespace).")
+            # Extract a sensible default name
+            extracted = False
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    target_path = node.name
+                    extracted = True
+                    break
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    nm = None
+                    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                        nm = node.targets[0].id
+                    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                        nm = node.target.id
+                    if nm:
+                        target_path = nm
+                        extracted = True
+                        break
+            if not extracted:
+                raise ValueError("declare(): could not extract a target name from the provided code.")
+        except SyntaxError as e:
+            raise ValueError(f"declare(): provided code failed to parse: {e}")
+        new_code = dedented_code
+
+    # From here on, new_code must be present and non-empty in every meaningful sense
+    if new_code is None:
+        raise ValueError("declare(): missing code. Use remove_declaration() for deletions.")
+
+    new_code = textwrap.dedent(new_code)
+    if new_code.strip() == "":
+        raise ValueError("declare(): empty code after dedent. Use remove_declaration() for deletions.")
+
+    try:
+        parsed = ast.parse(new_code)
+    except SyntaxError as e:
+        raise ValueError(f"declare(): code failed to parse: {e}")
+
+    if not getattr(parsed, "body", None):
+        # Only comments/whitespace
+        raise ValueError("declare(): code parses to an empty module (only comments/whitespace).")
+
+    # Track file for git operations BEFORE modifying it
+    if hasattr(declare, '_rollback_manager'):
+        declare._rollback_manager.track_file(file_path)
+
+    with open(file_path, 'r') as f:
+        content = f.read()
+
+    target_name, lexical_chain = parse_lexical_chain(target_path)
+
+    # Extract top-level declarations from the provided code (to support multi-decl payloads)
+    decls = _extract_declarations_with_parents(new_code)
+    if len(decls) == 0:
+        raise ValueError("declare(): no top-level function/class/assignment found in code payload.")
+
+    # If we only found one declaration, keep the original single-target behavior
+    if len(decls) <= 1:
+        # For assignments, prefer remove+insert fallback
+        if target_name in content and '=' in new_code:
+            c2, removed = remove_block(content, target_name, lexical_chain)
+            if removed:
+                new_content = insert_block(c2, new_code, target_name=target_name, lexical_chain=lexical_chain)
+            else:
+                new_content = insert_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+        else:
+            # Use replace path for defs/classes
+            new_content, was_replaced = replace_block(
+                content, new_code, target_name=target_name, lexical_chain=lexical_chain
+            )
+            if not was_replaced:
+                new_content = insert_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+
+        with open(file_path, 'w') as f:
+            f.write(new_content)
+        return
+
+    # Multi-declaration path: apply target-matching decl first, then the rest
+    new_content = content
+    first_idx = 0
+    for i, (nm, _) in enumerate(decls):
+        if nm == target_name:
+            first_idx = i
+            break
+
+    first_decl = decls[first_idx]
+    rest_decls = decls[:first_idx] + decls[first_idx + 1:]
+
+    def _apply_one(curr_content: str, nm: str, code_text: str) -> str:
+        if nm in curr_content and '=' in code_text:
+            c2, removed = remove_block(curr_content, nm, lexical_chain)
+            if removed:
+                return insert_block(c2, code_text, target_name=nm, lexical_chain=lexical_chain)
+            return insert_block(curr_content, code_text, target_name=nm, lexical_chain=lexical_chain)
+        else:
+            c2, was_replaced = replace_block(curr_content, code_text, target_name=nm, lexical_chain=lexical_chain)
+            if not was_replaced:
+                c2 = insert_block(curr_content, code_text, target_name=nm, lexical_chain=lexical_chain)
+            return c2
+
+    new_content = _apply_one(new_content, first_decl[0], first_decl[1])
+    for nm, code_text in rest_decls:
+        new_content = _apply_one(new_content, nm, code_text)
+
+    with open(file_path, 'w') as f:
+        f.write(new_content)
+def _extract_replacement_node(mod: cst.Module, target_name: Optional[str] = None) -> tuple[Optional[cst.BaseStatement], Optional[str], Optional[str]]:
+    """
+    Extract the replacement node from parsed new_code module.
+
+    Returns:
+        tuple: (replacement_node, inferred_kind, inferred_name)
+    """
+    if len(mod.body) == 0:
+        return None, None, None
+
+    # Try to find the specific target if provided
+    if target_name and len(mod.body) > 1:
+        node_info = _find_node_by_name(mod.body, target_name)
+        if node_info:
+            return node_info
+
+    # Otherwise use the first valid node
+    for node in mod.body:
+        node_info = _extract_node_info(node)
+        if node_info[0] is not None:
+            return node_info
+
+    return None, None, None
+def _find_node_by_name(nodes: List[cst.BaseStatement], target_name: str) -> tuple[Optional[cst.BaseStatement], Optional[str], Optional[str]]:
+    """Find a specific node by name in a list of statements."""
+    for node in nodes:
+        if isinstance(node, cst.FunctionDef):
+            if node.name.value == target_name:
+                return node, "def", target_name
+        elif isinstance(node, cst.ClassDef):
+            if node.name.value == target_name:
+                return node, "class", target_name
+        elif isinstance(node, cst.SimpleStatementLine):
+            assign_name = _extract_assignment_name(node)
+            if assign_name == target_name:
+                return node, "assign", target_name
+    return None, None, None
+def _extract_node_info(node: cst.BaseStatement) -> tuple[Optional[cst.BaseStatement], Optional[str], Optional[str]]:
+    """
+    Extract node information for a single statement.
+
+    Returns:
+        tuple: (node, kind, name) or (None, None, None) if not a valid declaration
+    """
+    if isinstance(node, cst.FunctionDef):
+        return node, "def", node.name.value
+
+    elif isinstance(node, cst.ClassDef):
+        return node, "class", node.name.value
+
+    elif isinstance(node, cst.SimpleStatementLine):
+        name = _extract_assignment_name(node)
+        if name:
+            return node, "assign", name
+
+    return None, None, None
+def _extract_assignment_name(node: cst.SimpleStatementLine) -> Optional[str]:
+    """
+    Extract the variable name from an assignment statement.
+    Returns None if not a valid simple assignment.
+    """
+    if len(node.body) != 1:
+        return None
+
+    stmt = node.body[0]
+
+    if isinstance(stmt, cst.Assign):
+        if len(stmt.targets) == 1 and isinstance(stmt.targets[0].target, cst.Name):
+            return stmt.targets[0].target.value
+
+    elif isinstance(stmt, cst.AnnAssign):
+        if isinstance(stmt.target, cst.Name):
+            return stmt.target.value
+
+    return None
+def replace_block(content: str,
+                  new_code: str,
+                  target_name: Optional[str] = None,
+                  kind: Optional[str] = None,
+                  lexical_chain: Optional[List[str]] = None) -> tuple[str, bool]:
+    """
+    Replace a function, class, or assignment in `content` with `new_code` using LibCST.
+    - If `target_name`/`kind` are omitted, they are inferred from `new_code`.
+    - lexical_chain specifies the containment hierarchy (e.g., ['ClassName'] for a method)
+    - Handles multiple statements in new_code by extracting the target def/class/assignment
+
+    Returns:
+        tuple: (modified_content, was_replaced)
+    """
+    lexical_chain = lexical_chain or []
+
+    # Handle empty new_code as deletion
+    if len(new_code.strip()) == 0:
+        if not target_name:
+            raise ValueError("Cannot delete without target_name.")
+        stripped, _ = remove_block(content, target_name, lexical_chain)
+        return stripped, True
+
+    # Parse and extract the replacement node
+    mod = cst.parse_module(new_code)
+    replacement_node, inferred_kind, inferred_name = _extract_replacement_node(mod, target_name)
+
+    if replacement_node is None:
+        raise ValueError("new_code must contain at least one function, class, or assignment definition.")
+
+    # Use provided parameters or inferred values
+    kind = kind or inferred_kind
+    target_name = target_name or inferred_name
+
+    # Perform the replacement
+    single_node_code = cst.Module(body=[replacement_node]).code
+    transformer = ReplaceDeclaration(
+        target_name=target_name,
+        lexical_chain=lexical_chain,
+        new_code=single_node_code,
+        kind=kind,
+    )
+
+    module = cst.parse_module(content)
+    new_module = module.visit(transformer)
+
+    if transformer.replaced:
+        return new_module.code, True
+
+    # Fallback: if target exists but transformer didn't replace it, use remove+insert
+    if _target_exists(content, target_name, lexical_chain):
+        stripped, _ = remove_block(content, target_name, lexical_chain)
+        inserted = insert_block(stripped, new_code, target_name=target_name, lexical_chain=lexical_chain)
+        return inserted, True
+
+    # Target doesn't exist - no replacement performed
+    return content, False
+
+
+
+# Example usage
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == 'rollback':
+        interactive_rollback()
+
+

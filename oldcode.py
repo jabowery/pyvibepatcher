@@ -1,0 +1,1586 @@
+#!/usr/bin/env python3
+"""
+Script to apply source code and filesystem modifications with git rollback support
+Usage: python modify.py
+"""
+import os
+import shutil
+import re
+import logging
+import subprocess
+import datetime
+import json
+import libcst as cst
+from typing import Optional, List, Tuple
+import ast
+
+logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
+
+import stat
+import textwrap
+
+# near other LibCST helpers
+def _target_exists(source: str, target_name: str, chain: list[str]) -> bool:
+    try:
+        mod = cst.parse_module(source)
+    except Exception:
+        return False
+
+    class _Finder(cst.CSTVisitor):
+        def __init__(self):
+            self.stack = []
+            self.found = False
+        def visit_ClassDef(self, node: cst.ClassDef) -> None:
+            self.stack.append(node.name.value)
+        def leave_ClassDef(self, node: cst.ClassDef) -> None:
+            self.stack.pop()
+        def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
+            if node.name.value == target_name and (self.stack == chain or (not chain and not self.stack)):
+                self.found = True
+        def visit_SimpleStatementLine(self, node: cst.SimpleStatementLine) -> None:
+            if len(node.body) == 1 and isinstance(node.body[0], cst.Assign):
+                for t in node.body[0].targets:
+                    if isinstance(t.target, cst.Name) and t.target.value == target_name and (self.stack == chain or (not chain and not self.stack)):
+                        self.found = True
+
+    f = _Finder()
+    mod.visit(f)
+    return f.found
+
+
+def _is_assignment_to_name(stmt: cst.CSTNode, name: str) -> bool:
+    # Match: x = ...   (within a SimpleStatementLine)
+    if not isinstance(stmt, cst.SimpleStatementLine):
+        return False
+    for small in stmt.body:
+        if isinstance(small, cst.Assign):
+            for t in small.targets:
+                tgt = t.target
+                if isinstance(tgt, cst.Name) and tgt.value == name:
+                    return True
+    return False
+
+
+class _DeletionTransformer(cst.CSTTransformer):
+    """
+    Removes a declaration at the given lexical chain.
+    - lexical_chain == []  => operate at module level
+    - lexical_chain == ["A", "B"] => operate inside class A.B
+    Deletes:
+      * FunctionDef with matching name
+      * ClassDef with matching name
+      * Assign to matching name (top-level or inside class scope)
+    """
+    def __init__(self, target_name: str, lexical_chain: List[str]):
+        self.target_name = target_name
+        self.chain = lexical_chain
+        self.class_stack: List[str] = []
+        self.removed = False
+
+    # Track the current class stack
+    def visit_ClassDef(self, node: cst.ClassDef) -> None:
+        self.class_stack.append(node.name.value)
+
+    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.CSTNode:
+        # If we are exactly inside the desired class chain, filter this class body
+        if self.class_stack == self.chain:
+            new_body = []
+            for stmt in updated_node.body.body:
+                # Remove function with matching name
+                if isinstance(stmt, cst.FunctionDef) and stmt.name.value == self.target_name:
+                    self.removed = True
+                    continue
+                # Remove assignment to matching name
+                if _is_assignment_to_name(stmt, self.target_name):
+                    self.removed = True
+                    continue
+                new_body.append(stmt)
+            updated_node = updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
+        # Pop class stack on exit
+        self.class_stack.pop()
+        return updated_node
+
+    def leave_Module(self, original_node: cst.Module, updated_node: cst.Module) -> cst.CSTNode:
+        # Only act at module level when no class chain was requested
+        if len(self.chain) == 0:
+            new_body = []
+            for stmt in updated_node.body:
+                if isinstance(stmt, cst.FunctionDef) and stmt.name.value == self.target_name:
+                    self.removed = True
+                    continue
+                if isinstance(stmt, cst.ClassDef) and stmt.name.value == self.target_name:
+                    self.removed = True
+                    continue
+                if _is_assignment_to_name(stmt, self.target_name):
+                    self.removed = True
+                    continue
+                new_body.append(stmt)
+            updated_node = updated_node.with_changes(body=new_body)
+        return updated_node
+
+def remove_block(source: str, target_name: str, lexical_chain: List[str]) -> Tuple[str, bool]:
+    """
+    Remove a function/method/assignment designated by (lexical_chain, target_name).
+    Returns: (new_source, removed_bool)
+    """
+    try:
+        mod = cst.parse_module(source)
+    except Exception:
+        # If parsing fails, do nothing
+        return source, False
+    tr = _DeletionTransformer(target_name, lexical_chain)
+    new_mod = mod.visit(tr)
+    return new_mod.code, tr.removed
+
+
+class InsertIntoContainer(cst.CSTTransformer):
+    """Insert a node into a specific container in the AST"""
+    
+    def __init__(self, node_to_insert: cst.BaseStatement, lexical_chain: List[str]):
+        self.node_to_insert = node_to_insert
+        self.lexical_chain = lexical_chain
+        self.context_stack: List[str] = []
+        self.inserted = False
+
+    def visit_ClassDef(self, node: cst.ClassDef) -> bool:
+        self.context_stack.append(node.name.value)
+        return True
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
+        self.context_stack.append(node.name.value)
+        return True
+
+    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.BaseStatement:
+        try:
+            if self._matches_insertion_point():
+                # Insert the node into this class
+                new_body = list(updated_node.body.body) + [self.node_to_insert]
+                new_suite = updated_node.body.with_changes(body=new_body)
+                self.inserted = True
+                return updated_node.with_changes(body=new_suite)
+            return updated_node
+        finally:
+            self.context_stack.pop()
+
+    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.BaseStatement:
+        try:
+            if self._matches_insertion_point():
+                # Insert the node into this function
+                new_body = list(updated_node.body.body) + [self.node_to_insert]
+                new_suite = updated_node.body.with_changes(body=new_body)
+                self.inserted = True
+                return updated_node.with_changes(body=new_suite)
+            return updated_node
+        finally:
+            self.context_stack.pop()
+
+    def _matches_insertion_point(self) -> bool:
+        """Check if current context matches where we want to insert"""
+        return self.context_stack == self.lexical_chain
+
+class GitRollbackManager:
+    """Manages git-based rollback operations for code modifications"""
+    
+    def __init__(self, rollback_file='.modification_rollback.json'):
+        self.rollback_file = rollback_file
+        self.rollback_data = {}
+        self.tracked_files = set()
+        self.accumulated_message = ""
+    
+    def accumulate_message(self, message):
+        """Accumulate message text for commit message"""
+        if self.accumulated_message:
+            self.accumulated_message += "\n" + message
+        else:
+            self.accumulated_message = message
+
+    def get_accumulated_message(self):
+        """Get and clear accumulated message"""
+        message = self.accumulated_message
+        self.accumulated_message = ""
+        return message
+
+    def has_staged_changes(self):
+        """Check if there are staged changes ready to commit"""
+        try:
+            result = subprocess.run(['git', 'diff', '--cached', '--name-only'], 
+                                  check=True, capture_output=True, text=True)
+            return bool(result.stdout.strip())
+        except subprocess.CalledProcessError:
+            return False
+    def create_rollback_point(self, message=None, force_commit=False):
+        """
+        Create a git commit as a rollback point
+        
+        Args:
+            message: Commit message (auto-generated if None)
+            force_commit: If True, commit even if no changes exist
+            
+        Returns:
+            dict: Rollback information including commit hash, branch, timestamp
+            
+        Raises:
+            RuntimeError: If rollback point cannot be created
+        """
+        if not self.is_git_repo():
+            raise RuntimeError("Not in a git repository - rollback required for file modifications")
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        if message is None:
+            message = f"Pre-modification snapshot {timestamp}"
+        
+        current_commit = self.get_current_commit()
+        current_branch = self.get_current_branch()
+        
+        if not current_commit:
+            raise RuntimeError("Failed to get current git commit hash")
+        
+        # Check git configuration
+        try:
+            subprocess.run(['git', 'config', 'user.name'], check=True, capture_output=True)
+            subprocess.run(['git', 'config', 'user.email'], check=True, capture_output=True)
+        except subprocess.CalledProcessError:
+            raise RuntimeError("Git user.name and user.email must be configured")
+        
+        # If this is the initial rollback point creation (no existing rollback data), 
+        # save current commit as the rollback point
+        is_initial_rollback = not bool(self.rollback_data.get('commit_hash'))
+        
+        if is_initial_rollback:
+            self.rollback_data = {
+                'commit_hash': current_commit,
+                'branch': current_branch,
+                'timestamp': timestamp,
+                'message': f"Initial rollback point: {message}",
+                'was_clean': True
+            }
+            self._save_rollback_data()
+            logging.info(f"Created rollback point: {current_commit}")
+        
+        # Add only tracked files to staging
+        if self.tracked_files:
+            for file_path in self.tracked_files:
+                if os.path.exists(file_path):
+                    result = subprocess.run(['git', 'add', file_path], capture_output=True)
+                    if result.returncode != 0:
+                        raise RuntimeError(f"Failed to stage file {file_path}: {result.stderr.decode()}")
+                else:
+                    # File was deleted, add it for removal
+                    result = subprocess.run(['git', 'add', file_path], capture_output=True)
+                    if result.returncode != 0:
+                        logging.warning(f"Failed to stage deleted file {file_path}: {result.stderr.decode()}")
+        
+        # Check if there are staged changes to commit
+        has_staged = self.has_staged_changes()
+        
+        if not has_staged and not force_commit:
+            logging.info("No staged changes, using current HEAD as rollback point")
+            return self.rollback_data
+        else:
+            if not has_staged:
+                # force_commit=True but no staged changes - create empty commit
+                result = subprocess.run(['git', 'commit', '--no-verify', '--allow-empty', '-m', message], capture_output=True)
+            else:
+                # Normal commit with staged changes
+                result = subprocess.run(['git', 'commit', '--no-verify', '-m', message], capture_output=True)
+            
+            if result.returncode != 0:
+                stderr_msg = result.stderr.decode().strip()
+                stdout_msg = result.stdout.decode().strip()
+                error_details = f"stderr: {stderr_msg}, stdout: {stdout_msg}" if stderr_msg or stdout_msg else "no error details provided"
+                raise RuntimeError(f"Failed to create git commit: {error_details}")
+            
+            new_commit = self.get_current_commit()
+            if not new_commit:
+                raise RuntimeError("Failed to get commit hash after successful commit")
+            
+            logging.info(f"Created commit: {new_commit}")
+            
+            # For backward compatibility: if this was the initial call AND we created a commit,
+            # return info about the new commit. Otherwise, return original rollback data.
+            if is_initial_rollback:
+                # Update rollback data to point to the new commit for compatibility
+                updated_rollback_info = {
+                    'commit_hash': new_commit,
+                    'branch': current_branch,
+                    'timestamp': timestamp,
+                    'message': message,
+                    'was_clean': False
+                }
+                self.rollback_data = updated_rollback_info
+                self._save_rollback_data()
+                return updated_rollback_info
+            else:
+                # Return original rollback point for successive calls
+                return self.rollback_data
+
+
+
+    def track_file(self, file_path):
+        """Track a file for inclusion in git commits"""
+        self.tracked_files.add(file_path)
+    
+    def is_git_repo(self):
+        """Check if current directory is a git repository"""
+        try:
+            subprocess.run(['git', 'rev-parse', '--git-dir'], 
+                         check=True, capture_output=True)
+            return True
+        except subprocess.CalledProcessError:
+            return False
+    
+    def get_current_commit(self):
+        """Get current commit hash"""
+        try:
+            result = subprocess.run(['git', 'rev-parse', 'HEAD'], 
+                                  check=True, capture_output=True, text=True)
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return None
+    
+    def get_current_branch(self):
+        """Get current branch name"""
+        try:
+            result = subprocess.run(['git', 'branch', '--show-current'], 
+                                  check=True, capture_output=True, text=True)
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return None
+    
+    def has_uncommitted_changes(self):
+        """Check if there are uncommitted changes"""
+        try:
+            result = subprocess.run(['git', 'status', '--porcelain'], 
+                                  check=True, capture_output=True, text=True)
+            return bool(result.stdout.strip())
+        except subprocess.CalledProcessError:
+            return False
+    
+    def soft_rollback(self, commit_hash=None):
+        """
+        Soft rollback - reset to commit but keep changes staged
+        Useful for temporary rollbacks where you might want to re-apply changes
+        """
+        if not commit_hash:
+            commit_hash = self.rollback_data.get('commit_hash')
+        
+        if not commit_hash:
+            logging.error("No rollback commit specified")
+            return False
+        
+        try:
+            subprocess.run(['git', 'reset', '--soft', commit_hash], 
+                         check=True, capture_output=True)
+            logging.info(f"Soft rollback to {commit_hash} - changes staged")
+            return True
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Soft rollback failed: {e}")
+            return False
+    
+    def hard_rollback(self, commit_hash=None):
+        """
+        Hard rollback - completely reset to commit, discarding all changes
+        Use when temporarily testing modifications
+        """
+        if not commit_hash:
+            commit_hash = self.rollback_data.get('commit_hash')
+        
+        if not commit_hash:
+            logging.error("No rollback commit specified")
+            return False
+        
+        try:
+            subprocess.run(['git', 'reset', '--hard', commit_hash], 
+                         check=True, capture_output=True)
+            logging.info(f"Hard rollback to {commit_hash} - all changes discarded")
+            return True
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Hard rollback failed: {e}")
+            return False
+    
+    def abandon_to_commit(self, commit_hash=None, new_branch_name=None):
+        """
+        Abandon current development line and make the rollback commit the new HEAD
+        This creates a new branch from the rollback point and switches to it
+        
+        Args:
+            commit_hash: Commit to abandon back to (uses stored rollback if None)
+            new_branch_name: Name for new branch (auto-generated if None)
+            
+        Returns:
+            str: Name of the new branch created, or None if failed
+        """
+        if not commit_hash:
+            commit_hash = self.rollback_data.get('commit_hash')
+        
+        if not commit_hash:
+            logging.error("No rollback commit specified")
+            return None
+        
+        current_branch = self.get_current_branch()
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        if new_branch_name is None:
+            new_branch_name = f"abandoned-from-{current_branch}-{timestamp}"
+        
+        try:
+            # Create new branch from the rollback commit
+            subprocess.run(['git', 'checkout', '-b', new_branch_name, commit_hash], 
+                         check=True, capture_output=True)
+            
+            logging.info(f"Abandoned development line - new branch '{new_branch_name}' created from {commit_hash}")
+            logging.info(f"Previous branch '{current_branch}' still exists if you need to reference it")
+            
+            # Update rollback data for new branch
+            self.rollback_data['abandoned_from_branch'] = current_branch
+            self.rollback_data['new_branch'] = new_branch_name
+            self._save_rollback_data()
+            
+            return new_branch_name
+            
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Failed to abandon to commit: {e}")
+            return None
+    
+    def force_reset_branch_to_commit(self, commit_hash=None, branch_name=None):
+        """
+        Force reset current or specified branch to rollback commit
+        WARNING: This destroys the commit history after the rollback point
+        
+        Args:
+            commit_hash: Commit to reset to (uses stored rollback if None)
+            branch_name: Branch to reset (current branch if None)
+        """
+        if not commit_hash:
+            commit_hash = self.rollback_data.get('commit_hash')
+        
+        if not commit_hash:
+            logging.error("No rollback commit specified")
+            return False
+        
+        current_branch = self.get_current_branch()
+        target_branch = branch_name or current_branch
+        
+        try:
+            # Switch to target branch if not already on it
+            if current_branch != target_branch:
+                subprocess.run(['git', 'checkout', target_branch], 
+                             check=True, capture_output=True)
+            
+            # Force reset to the commit
+            subprocess.run(['git', 'reset', '--hard', commit_hash], 
+                         check=True, capture_output=True)
+            
+            logging.warning(f"DESTRUCTIVE: Reset branch '{target_branch}' to {commit_hash}")
+            logging.warning("All commits after the rollback point have been permanently lost")
+            
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Force reset failed: {e}")
+            return False
+    
+    def show_rollback_options(self):
+        """Display available rollback options to user"""
+        if not self.rollback_data:
+            self._load_rollback_data()
+        
+        if not self.rollback_data:
+            logging.info("No rollback data available")
+            return
+        
+        commit_hash = self.rollback_data['commit_hash']
+        branch = self.rollback_data.get('branch', 'unknown')
+        timestamp = self.rollback_data.get('timestamp', 'unknown')
+        
+        print("\n=== ROLLBACK OPTIONS ===")
+        print(f"Rollback commit: {commit_hash}")
+        print(f"Original branch: {branch}")
+        print(f"Created at: {timestamp}")
+        print("\nAvailable actions:")
+        print("1. Soft rollback - git reset --soft (keeps changes staged)")
+        print("2. Hard rollback - git reset --hard (discards all changes)")
+        print("3. Abandon current line - creates new branch from rollback point")
+        print("4. Force reset branch - DESTRUCTIVE, permanently loses commits")
+        print("\nManual commands:")
+        print(f"  git reset --soft {commit_hash}")
+        print(f"  git reset --hard {commit_hash}")
+        print(f"  git checkout -b new-branch-name {commit_hash}")
+    
+    def _save_rollback_data(self):
+        """Save rollback data to file"""
+        try:
+            with open(self.rollback_file, 'w') as f:
+                json.dump(self.rollback_data, f, indent=2)
+        except Exception as e:
+            logging.warning(f"Could not save rollback data: {e}")
+    
+    def _load_rollback_data(self):
+        """Load rollback data from file"""
+        try:
+            if os.path.exists(self.rollback_file):
+                with open(self.rollback_file, 'r') as f:
+                    self.rollback_data = json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load rollback data: {e}")
+            self.rollback_data = {}
+
+# pip install libcst
+
+def parse_lexical_chain(target_path: str) -> tuple[str, List[str]]:
+    """
+    Parse a lexical chain like 'ClassName.method_name' or 'outer_func.inner_func'
+    
+    Args:
+        target_path: Dot-separated path like 'ClassName.method_name'
+        
+    Returns:
+        tuple: (final_target_name, list_of_container_names)
+    """
+    parts = target_path.split('.')
+    if len(parts) == 1:
+        return parts[0], []
+    
+    return parts[-1], parts[:-1]
+
+
+class ReplaceDeclaration(cst.CSTTransformer):
+    """
+    Replace a function/method/assignment designated by (lexical_chain, target_name).
+    Supports:
+      - Module-level def/assign
+      - Method/assign inside a class chain like A.B (self.chain == ["A","B"])
+    """
+    def __init__(self, target_name: str, lexical_chain: List[str], new_code: str, kind: Optional[str] = None):
+        self.target_name = target_name
+        self.chain = lexical_chain or []
+        self.new_code = new_code
+        self.kind = kind
+        self.class_stack: List[str] = []
+        self.replaced = False  # <-- add this
+
+        try:
+            self._replacement_module = cst.parse_module(self.new_code)
+        except Exception:
+            self._replacement_module = None
+
+    # ---- context tracking for lexical chain ----
+    def visit_ClassDef(self, node: cst.ClassDef) -> None:
+        self.class_stack.append(node.name.value)
+
+    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.CSTNode:
+        # Replace methods/assignments inside the matched class chain is handled in the leaf visitors
+        self.class_stack.pop()
+        return updated_node
+
+    def _matches_lexical_chain(self) -> bool:
+        # For module-level targets, require we are NOT inside any class
+        if not self.chain:
+            return len(self.class_stack) == 0
+        # For nested class targets, require the current stack equals the chain
+        return self.class_stack == self.chain
+
+    # ---- helpers to extract replacement nodes from new_code ----
+    def _first_funcdef(self) -> Optional[cst.FunctionDef]:
+        if not self._replacement_module:
+            return None
+        for stmt in self._replacement_module.body:
+            if isinstance(stmt, cst.FunctionDef):
+                return stmt
+        return None
+
+    def _first_assign_stmtline(self) -> Optional[cst.SimpleStatementLine]:
+        if not self._replacement_module:
+            return None
+        for stmt in self._replacement_module.body:
+            if isinstance(stmt, cst.SimpleStatementLine) and stmt.body and isinstance(stmt.body[0], cst.Assign):
+                return stmt
+        return None
+
+    # ---- replacements ----
+    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.CSTNode:
+        # Replace a function (module-level or method) if names and lexical chain match
+        if self.kind in (None, "func", "def"):
+            if original_node.name.value == self.target_name and self._matches_lexical_chain():
+                rep = self._first_funcdef()
+                if rep is not None:
+                    return rep
+        return updated_node
+
+    def leave_SimpleStatementLine(self, original_node: cst.SimpleStatementLine, updated_node: cst.SimpleStatementLine) -> cst.BaseStatement:
+        if self.kind in (None, "assign"):
+            if len(updated_node.body) == 1 and isinstance(updated_node.body[0], cst.Assign):
+                assign_node = updated_node.body[0]
+                for tgt in assign_node.targets:
+                    if isinstance(tgt.target, cst.Name) and tgt.target.value == self.target_name:
+                        if self._matches_lexical_chain():
+                            rep = self._first_assign_stmtline()
+                            if rep is not None:
+                                self.replaced = True  # <-- set
+                                return rep
+        return updated_node
+
+
+def replace_block(content: str,
+                  new_code: str,
+                  target_name: Optional[str] = None,
+                  kind: Optional[str] = None,
+                  lexical_chain: Optional[List[str]] = None) -> tuple[str, bool]:
+    """
+    Replace a function, class, or assignment in `content` with `new_code` using LibCST.
+    - If `target_name`/`kind` are omitted, they are inferred from `new_code`.
+    - lexical_chain specifies the containment hierarchy (e.g., ['ClassName'] for a method)
+    - Handles multiple statements in new_code by extracting the target def/class/assignment
+    
+    Returns:
+        tuple: (modified_content, was_replaced)
+    """
+    # Parse new_code
+    mod = cst.parse_module(new_code)
+    
+    # Initialize variables to avoid UnboundLocalError
+    replacement_node = None
+    inferred_kind = None
+    inferred_name = None
+    
+#    # Handle different cases based on content of new_code
+#    if len(mod.body) == 0:
+#        raise ValueError("new_code cannot be empty.")
+
+    if len(new_code.strip()) == 0:
+        # Delete target instead of raising an error
+        if not target_name:
+            raise ValueError("Cannot delete without target_name.")
+        stripped, _ = remove_block(content, target_name, lexical_chain or [])
+        return stripped, True
+
+    if len(mod.body) == 0:
+        raise ValueError("new_code cannot be empty (after parsing).")
+
+    elif len(mod.body) == 1:
+        # Original behavior - single statement
+        node = mod.body[0]
+        
+        if isinstance(node, cst.FunctionDef):
+            replacement_node = node
+            inferred_kind = "def"
+            inferred_name = node.name.value
+        elif isinstance(node, cst.ClassDef):
+            replacement_node = node
+            inferred_kind = "class"
+            inferred_name = node.name.value
+        elif isinstance(node, cst.SimpleStatementLine):
+            # Check if it's an assignment
+            if (len(node.body) == 1):
+                if (isinstance(node.body[0], cst.Assign) or isinstance(node.body[0], cst.AnnAssign)):
+                    assign_node = node.body[0]
+                    if (isinstance(node.body[0], cst.Assign)):
+                        if (len(assign_node.targets) == 1 and 
+                            isinstance(assign_node.targets[0].target, cst.Name)):
+                            replacement_node = node
+                            inferred_kind = "assign"
+                            inferred_name = assign_node.targets[0].target.value
+                        else:
+                            raise ValueError("new_code must contain a simple assignment to a single variable.")
+                    else:
+                        target = assign_node.target
+                        if (isinstance(target, cst.Name)):
+                            replacement_node = node
+                            inferred_kind = "assign"
+                            inferred_name = target.value
+                        else:
+                            raise ValueError("Annotated assignment malformed.")
+                else:
+                    logging.debug(f"content: {content}")
+                    logging.debug(f"new_code: {new_code}")
+                    raise ValueError("new_code must contain a function, class, or assignment definition.")
+            else:
+                logging.debug(f"content: {content}")
+                logging.debug(f"new_code: {new_code}")
+                raise ValueError("new_code must contain a function, class, or assignment definition.")
+        else:
+            logging.debug(f"content: {content}")
+            logging.debug(f"new_code: {new_code}")
+            raise ValueError("new_code must contain a function, class, or assignment definition.")
+    
+    else:
+        # Multiple statements - find the target def/class/assignment
+        # If target_name is provided, look for it specifically
+        if target_name:
+            for node in mod.body:
+                if isinstance(node, (cst.FunctionDef, cst.ClassDef)):
+                    if node.name.value == target_name:
+                        replacement_node = node
+                        inferred_kind = "def" if isinstance(node, cst.FunctionDef) else "class"
+                        inferred_name = node.name.value
+                        break
+                elif isinstance(node, cst.SimpleStatementLine):
+                    if (len(node.body) == 1 and isinstance(node.body[0], cst.Assign)):
+                        assign_node = node.body[0]
+                        for target in assign_node.targets:
+                            if isinstance(target.target, cst.Name) and target.target.value == target_name:
+                                replacement_node = node
+                                inferred_kind = "assign"
+                                inferred_name = target_name
+                                break
+                        if replacement_node:
+                            break
+        
+        # If not found or no target_name provided, use the first def/class/assignment
+        if replacement_node is None:
+            for node in mod.body:
+                if isinstance(node, (cst.FunctionDef, cst.ClassDef)):
+                    replacement_node = node
+                    inferred_kind = "def" if isinstance(node, cst.FunctionDef) else "class"
+                    inferred_name = node.name.value
+                    break
+                elif isinstance(node, cst.SimpleStatementLine):
+                    if (len(node.body) == 1 and isinstance(node.body[0], cst.Assign)):
+                        assign_node = node.body[0]
+                        if (len(assign_node.targets) == 1 and 
+                            isinstance(assign_node.targets[0].target, cst.Name)):
+                            replacement_node = node
+                            inferred_kind = "assign"
+                            inferred_name = assign_node.targets[0].target.value
+                            break
+        
+        if replacement_node is None:
+            raise ValueError("new_code must contain at least one function, class, or assignment definition.")
+    
+    # Use provided parameters or infer from the found node
+    kind = kind or inferred_kind
+    target_name = target_name or inferred_name
+    
+    # Perform the replacement using only the replacement_node
+    module = cst.parse_module(content)
+    
+    # Create a version of new_code with just the replacement node for the transformer
+    single_node_code = cst.Module(body=[replacement_node]).code
+
+    transformer = ReplaceDeclaration(
+        target_name=target_name,
+        lexical_chain=lexical_chain or [],
+        new_code=single_node_code,
+        kind=kind,
+    )
+    module = cst.parse_module(content)
+    new_module = module.visit(transformer)
+
+    # Primary path result
+    if transformer.replaced:
+        return new_module.code, True
+
+    # If the target exists but we didn't mark replaced, do a robust fallback:
+    if _target_exists(content, target_name, lexical_chain or []):
+        # 1) remove the old target in the right scope
+        stripped, _ = remove_block(content, target_name, lexical_chain or [])
+        # 2) insert the new one
+        inserted = insert_block(stripped, new_code, target_name=target_name, lexical_chain=lexical_chain or [])
+        return inserted, True
+
+    # Otherwise: no target to replace (caller can decide to insert)
+    return content, False
+
+
+def insert_block(content: str,
+                 new_code: str,
+                 target_name: Optional[str] = None,
+                 lexical_chain: Optional[List[str]] = None) -> str:
+    """
+    Insert a function or class into content at the appropriate location.
+    For top-level insertions, places before any executable code like if __name__ == '__main__'.
+
+    Args:
+        content: Source code content
+        new_code: New function/class code to insert
+        target_name: Name of the function/class to insert
+        lexical_chain: Container hierarchy for nested insertion
+
+    Returns:
+        Modified content with inserted code
+    """
+    # Parse the new code to determine what we're inserting
+    mod = cst.parse_module(new_code)
+    if len(mod.body) != 1:
+        raise ValueError("new_code must contain exactly one top-level def/class.")
+
+    node = mod.body[0]
+
+    module = cst.parse_module(content)
+
+    if not lexical_chain:
+        # Top-level insertion - find the right place before executable code
+        
+        # Find the insertion point before executable statements
+        insertion_index = len(module.body)  # Default to end
+        
+        for i, stmt in enumerate(module.body):
+            # Check if this statement is executable code that should come after declarations
+            if _is_executable_statement(stmt):
+                insertion_index = i
+                break
+        
+        # Insert at the found position
+        new_body = list(module.body)
+        new_body.insert(insertion_index, node)
+        new_module = module.with_changes(body=new_body)
+    else:
+        # Nested insertion - insert into specific container
+        transformer = InsertIntoContainer(node, lexical_chain)
+        new_module = module.visit(transformer)
+        
+        if not transformer.inserted:
+            raise ValueError(f"Could not find container {'.'.join(lexical_chain)} for insertion")
+
+    return new_module.code
+
+def _is_executable_statement(stmt: cst.BaseStatement) -> bool:
+    """
+    Check if a statement is executable code that should come after declarations.
+    Returns True for if __name__ == '__main__' blocks and other executable statements.
+    """
+    # Check for if __name__ == '__main__' pattern
+    if isinstance(stmt, cst.If):
+        test = stmt.test
+        if isinstance(test, cst.Comparison):
+            left = test.left
+            if (isinstance(left, cst.Name) and left.value == "__name__" and
+                len(test.comparisons) == 1):
+                comp = test.comparisons[0]
+                if (isinstance(comp.operator, cst.Equal) and
+                    isinstance(comp.comparator, cst.SimpleString) and
+                    comp.comparator.value in ("'__main__'", '"__main__"')):
+                    return True
+    
+    # Check for other executable statements at module level
+    if isinstance(stmt, cst.SimpleStatementLine):
+        for substmt in stmt.body:
+            # Skip module docstrings
+            if isinstance(substmt, cst.Expr) and isinstance(substmt.value, cst.SimpleString):
+                continue
+            # Skip common module setup function calls that are part of configuration
+            elif isinstance(substmt, cst.Expr) and isinstance(substmt.value, cst.Call):
+                if isinstance(substmt.value.func, cst.Attribute):
+                    # Allow common setup patterns like logging.basicConfig(), os.environ.update(), etc.
+                    attr_name = substmt.value.func.attr.value
+                    if attr_name in ("basicConfig", "getLogger", "configure", "setup", "init"):
+                        continue
+                # Skip bare function calls that look like setup
+                elif isinstance(substmt.value.func, cst.Name):
+                    func_name = substmt.value.func.value
+                    if func_name in ("setup", "configure", "init", "initialize"):
+                        continue
+                # Other function calls are considered executable
+                return True
+            # Other bare expressions (not assignments or setup calls) are executable
+            elif isinstance(substmt, cst.Expr):
+                return True
+    
+    # Other control flow that's typically executable
+    if isinstance(stmt, (cst.For, cst.While, cst.Try, cst.With)):
+        return True
+        
+    return False
+
+def _contains_function_call(node: cst.BaseExpression) -> bool:
+    """Check if an expression contains a function call."""
+    if isinstance(node, cst.Call):
+        return True
+    
+    # Recursively check compound expressions
+    if hasattr(node, 'left') and hasattr(node, 'right'):
+        return (_contains_function_call(node.left) if hasattr(node.left, 'left') or isinstance(node.left, cst.Call) else False) or \
+               (_contains_function_call(node.right) if hasattr(node.right, 'left') or isinstance(node.right, cst.Call) else False)
+    
+    return False
+
+def move_file(src, dst):
+    """Move/rename file or directory"""
+    # Track both source and destination for git operations
+    if hasattr(move_file, '_rollback_manager'):
+        move_file._rollback_manager.track_file(src)
+        move_file._rollback_manager.track_file(dst)
+    
+    shutil.move(src, dst)
+    logging.debug(f"Moved {src} to {dst}")
+
+def make_directory(path):
+    """Create directory"""
+    os.makedirs(path, exist_ok=True)
+    logging.debug(f"Created directory {path}")
+
+def remove_file(path, recursive=False):
+    """Remove file or directory"""
+    # Track file for git operations before removal
+    if hasattr(remove_file, '_rollback_manager'):
+        remove_file._rollback_manager.track_file(path)
+    
+    if recursive and os.path.isdir(path):
+        shutil.rmtree(path)
+        logging.debug(f"Removed directory {path} recursively")
+    elif os.path.isfile(path) or os.path.islink(path):
+        os.remove(path)
+        logging.debug(f"Removed file {path}")
+    elif os.path.isdir(path):
+        os.rmdir(path)
+        logging.debug(f"Removed empty directory {path}")
+    else:
+        logging.info(f"Path {path} perhaps already removed.")
+
+def modification_description(description_text):
+    """
+    Add description text to the accumulated commit message
+    
+    Args:
+        description_text: Text to append to commit message
+    """
+    if hasattr(modification_description, '_rollback_manager'):
+        modification_description._rollback_manager.accumulate_message(description_text)
+    
+# Interactive rollback interface
+def interactive_rollback():
+    """Interactive interface for rollback operations"""
+    manager = GitRollbackManager()
+    manager._load_rollback_data()
+    
+    if not manager.rollback_data:
+        print("No rollback data found")
+        return
+    
+    manager.show_rollback_options()
+    
+    while True:
+        choice = input("\nEnter choice (1-4, or 'q' to quit): ").strip()
+        
+        if choice == 'q':
+            break
+        elif choice == '1':
+            manager.soft_rollback()
+            break
+        elif choice == '2':
+            manager.hard_rollback()
+            break
+        elif choice == '3':
+            branch_name = input("New branch name (or press Enter for auto): ").strip()
+            if not branch_name:
+                branch_name = None
+            manager.abandon_to_commit(new_branch_name=branch_name)
+            break
+        elif choice == '4':
+            confirm = input("WARNING: This will permanently lose commits! Type 'yes' to confirm: ")
+            if confirm.lower() == 'yes':
+                manager.force_reset_branch_to_commit()
+                break
+        else:
+            print("Invalid choice")
+
+def open_with_mkdir(filepath, mode='w', **kwargs):
+    """
+    Opens a file at the given filepath, creating any necessary intermediate directories if they don't exist.
+    
+    Args:
+    filepath (str): The path to the file to open.
+    mode (str): The mode in which to open the file (default: 'w' for write).
+    **kwargs: Additional keyword arguments to pass to the built-in open() function.
+    
+    Returns:
+    file: An open file object.
+    
+    Example:
+    >>> with open_with_mkdir('path/to/new/dir/file.txt', 'w') as f:
+    ...     f.write('Hello, world!')
+    """
+    # Extract the directory from the filepath
+    directory = os.path.dirname(filepath)
+    
+    # Create the directory if it doesn't exist
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    
+    # Open and return the file object
+    return open(filepath, mode=mode, **kwargs)
+
+def replace_file_contents(file_path, file_content, make_executable=False):
+    if os.path.exists(file_path):
+        remove_file(file_path)
+    create_file(file_path, file_content, make_executable=make_executable)
+
+def create_file(file_path, file_content, make_executable=True):
+    """Create a file
+    
+    Args:
+        file_path: Path where script should be created
+        file_content: Content of the script
+        make_executable: If True, set executable permissions (Unix/Linux/Mac)
+    """
+    
+    #with open(file_path, 'w') as f:
+    with open_with_mkdir(file_path, 'w') as f:
+        f.write(file_content)
+    
+    if make_executable:
+        # Add executable permissions for owner, group, and others
+        current_permissions = os.stat(file_path).st_mode
+        os.chmod(file_path, current_permissions | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    
+    # Track file for git operations
+    if hasattr(create_file, '_rollback_manager'):
+        create_file._rollback_manager.track_file(file_path)
+    
+    logging.debug(f"Created {'executable script' if make_executable else 'file'} {file_path}")
+
+
+"""
+Addition to code_mod_defs.py to support update_header modifications
+This adds the ability to modify the module header section of Python files
+"""
+
+
+def update_header(file_path: str, header_content: str):
+    """
+    Replace or set the module header section of a Python file.
+    The module header includes everything before the first class or function definition:
+    - Shebang line
+    - Encoding declarations  
+    - Module docstring
+    - Import statements
+    - Module-level constants and variables
+    - Any initial setup code that runs on import
+    
+    Args:
+        file_path: Path to the Python file to modify
+        header_content: New header content to replace existing header
+    """
+    # Track file for git operations
+    if hasattr(update_header, '_rollback_manager'):
+        update_header._rollback_manager.track_file(file_path)
+    
+    with open(file_path, 'r') as f:
+        content = f.read()
+    
+    new_content = replace_update_header(content, header_content)
+    
+    with open(file_path, 'w') as f:
+        f.write(new_content)
+
+
+def replace_update_header(content: str, new_header: str) -> str:
+    """
+    Replace the module header section with new content.
+    
+    Args:
+        content: Original Python file content
+        new_header: New header content to insert
+        
+    Returns:
+        Modified file content with new header
+    """
+    try:
+        module = cst.parse_module(content)
+    except Exception as e:
+        # If CST parsing fails, fall back to regex-based approach
+        return _replace_header_regex_fallback(content, new_header)
+    
+    # Find the first class or function definition
+    first_def_index = None
+    main_block_index = None
+    
+    for i, stmt in enumerate(module.body):
+        # Check for class or function definitions
+        if isinstance(stmt, (cst.FunctionDef, cst.ClassDef)):
+            if first_def_index is None:
+                first_def_index = i
+                break
+        
+        # Check for if __name__ == '__main__' block
+        if isinstance(stmt, cst.If) and _is_main_block(stmt):
+            if main_block_index is None:
+                main_block_index = i
+    
+    # Determine where to split: before first def/class, or before __main__ if no defs
+    split_index = first_def_index if first_def_index is not None else main_block_index
+    
+    # Extract shebang and encoding lines from new_header before CST parsing
+    new_header_lines = new_header.splitlines()
+    shebang_lines = []
+    parseable_lines = []
+    
+    for line in new_header_lines:
+        stripped = line.strip()
+        if (stripped.startswith('#!') or 
+            (stripped.startswith('#') and ('coding:' in stripped or 'coding=' in stripped))):
+            shebang_lines.append(line)
+        else:
+            parseable_lines.append(line)
+    
+    parseable_header = '\n'.join(parseable_lines)
+    
+    # Parse the parseable portion of new header
+    try:
+        if parseable_header.strip():
+            new_header_module = cst.parse_module(parseable_header)
+            new_header_stmts = new_header_module.body
+        else:
+            new_header_stmts = []
+    except Exception:
+        # If new header doesn't parse, treat as raw text and try to preserve structure
+        return _replace_header_with_raw_text(content, new_header, split_index)
+    
+    if split_index is None:
+        # No functions, classes, or __main__ block - replace entire file with header
+        result_code = cst.Module(body=new_header_stmts).code
+    else:
+        # Keep everything from split_index onwards, replace everything before
+        remaining_stmts = module.body[split_index:]
+        new_body = list(new_header_stmts) + list(remaining_stmts)
+        result_code = cst.Module(body=new_body).code
+    
+    # Prepend shebang and encoding lines if any
+    if shebang_lines:
+        shebang_text = '\n'.join(shebang_lines) + '\n'
+        result_code = shebang_text + result_code
+    
+    return result_code
+
+
+def _is_main_block(stmt: cst.If) -> bool:
+    """Check if an If statement is a __name__ == '__main__' block"""
+    test = stmt.test
+    if isinstance(test, cst.Comparison):
+        left = test.left
+        if (isinstance(left, cst.Name) and left.value == "__name__" and
+            len(test.comparisons) == 1):
+            comp = test.comparisons[0]
+            if (isinstance(comp.operator, cst.Equal) and
+                isinstance(comp.comparator, cst.SimpleString) and
+                comp.comparator.value in ("'__main__'", '"__main__"')):
+                return True
+    return False
+
+
+def _replace_header_regex_fallback(content: str, new_header: str) -> str:
+    """
+    Fallback method using regex when CST parsing fails.
+    This is less precise but handles malformed Python files.
+    """
+    lines = content.splitlines(keepends=True)
+    
+    # Find first function or class definition
+    first_def_line = None
+    main_block_line = None
+    
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        
+        # Look for function or class definitions at start of line (no indentation)
+        if re.match(r'^(def|class)\s+\w+', stripped):
+            if first_def_line is None:
+                first_def_line = i
+                break
+        
+        # Look for __main__ block
+        if re.match(r"^if\s+__name__\s*==\s*['\"]__main__['\"]", stripped):
+            if main_block_line is None:
+                main_block_line = i
+    
+    # Determine split point
+    split_line = first_def_line if first_def_line is not None else main_block_line
+    
+    if split_line is None:
+        # No functions, classes, or __main__ - replace entire file
+        return new_header
+    else:
+        # Replace header section, keep the rest
+        remaining_content = ''.join(lines[split_line:])
+        return new_header + remaining_content
+
+
+def _replace_header_with_raw_text(content: str, new_header: str, split_index: Optional[int]) -> str:
+    """Handle case where new_header doesn't parse as valid Python"""
+    if split_index is None:
+        return new_header
+    
+    try:
+        module = cst.parse_module(content)
+        remaining_stmts = module.body[split_index:]
+        remaining_code = cst.Module(body=remaining_stmts).code
+        return new_header + remaining_code
+    except Exception:
+        # Complete fallback to text manipulation
+        return _replace_header_regex_fallback(content, new_header)
+
+# Example usage in modification file format:
+"""
+MMM update_header MMM
+path/to/file.py
+@@@@@@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+\"\"\"
+Updated module docstring explaining what this module does.
+\"\"\"
+
+import os
+import sys
+from pathlib import Path
+from typing import List, Dict, Optional
+
+# Updated module constants
+VERSION = "2.0.0"
+DEBUG = True
+CONFIG_PATH = "/etc/myapp/config.yaml"
+
+# Module initialization
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+"""
+
+def apply_modification_set(modifications, auto_rollback_on_failure=True, auto_commit=None, commit_message=None):
+    """
+    Apply a set of modifications with rollback support
+    
+    Args:
+        modifications: List of (function, args, kwargs) tuples
+        auto_rollback_on_failure: If True, automatically rollback on any failure
+        auto_commit: If True, force commit even if no files tracked. If None, use existing logic.
+        commit_message: Override commit message. If None, use accumulated descriptions.
+        
+    Returns:
+        GitRollbackManager: Manager instance for manual rollback operations
+        
+    Raises:
+        RuntimeError: If rollback capability cannot be established
+    """
+    rollback_manager = GitRollbackManager()
+    
+    # Set rollback manager on modification functions
+    declare._rollback_manager = rollback_manager
+    move_file._rollback_manager = rollback_manager
+    remove_file._rollback_manager = rollback_manager
+    create_file._rollback_manager = rollback_manager
+    modification_description._rollback_manager = rollback_manager
+    update_header._rollback_manager = rollback_manager
+
+    # Create rollback point - this will raise if it fails
+    rollback_info = rollback_manager.create_rollback_point("Before LLM modifications")
+    
+    # Process modifications and build commit message
+    accumulated_descriptions = []
+    other_modifications = []
+    for func, args, kwargs in modifications:
+        if func == modification_description:
+            accumulated_descriptions.append(args[0])
+        else:
+            other_modifications.append((func, args, kwargs))
+    
+    # Set accumulated message from all descriptions
+    if accumulated_descriptions:
+        full_description = "\n".join(accumulated_descriptions)
+        rollback_manager.accumulate_message(full_description)
+    
+    try:
+        # Apply all non-description modifications
+        for func, args, kwargs in other_modifications:
+            print(func.__name__)
+            func(*args, **kwargs)
+        
+        # Determine if we should commit
+        should_commit = False
+        if auto_commit is True:
+            should_commit = True
+        elif auto_commit is None and rollback_manager.tracked_files:
+            should_commit = True
+        
+        # Create final commit if needed
+        if should_commit:
+            final_commit_message = commit_message
+            if not final_commit_message:
+                final_commit_message = rollback_manager.get_accumulated_message()
+            if not final_commit_message:
+                final_commit_message = "After LLM modifications"
+            
+            rollback_manager.create_rollback_point(final_commit_message, force_commit=True)
+        
+        logging.info("All modifications completed successfully")
+        rollback_manager.show_rollback_options()
+        return rollback_manager
+        
+    except Exception as e:
+        logging.error(f"Modifications failed: {e}")
+        
+        if auto_rollback_on_failure:
+            logging.info("Auto-rolling back due to failure...")
+            success = rollback_manager.hard_rollback()
+            if success:
+                logging.info("Rollback completed successfully")
+            else:
+                logging.error("Rollback failed - manual intervention may be required")
+        else:
+            logging.info("Manual rollback available - use returned manager")
+            rollback_manager.show_rollback_options()
+        
+        raise
+    finally:
+        # Clean up rollback manager references
+        if hasattr(declare, '_rollback_manager'):
+            del declare._rollback_manager
+        if hasattr(move_file, '_rollback_manager'):
+            del move_file._rollback_manager
+        if hasattr(remove_file, '_rollback_manager'):
+            del remove_file._rollback_manager
+        if hasattr(create_file, '_rollback_manager'):
+            del create_file._rollback_manager
+        if hasattr(modification_description, '_rollback_manager'):
+            del modification_description._rollback_manager
+        if hasattr(update_header, '_rollback_manager'):
+            del update_header._rollback_manager
+
+# Helper: Use AST to properly identify top-level declarations
+def _add_parent_refs(node, parent=None):
+    node.parent = parent
+    for child in ast.iter_child_nodes(node):
+        _add_parent_refs(child, node)
+
+def _extract_declarations_with_parents(src: str):
+    try:
+        tree = ast.parse(src)
+        _add_parent_refs(tree)
+    except SyntaxError as e:
+        logging.warning(f"declare(): Could not parse new_code as valid Python: {e}")
+        return []
+    
+    decls = []
+    
+    # Only look at direct children of the module
+    for node in tree.body:
+        name = None
+        start_line = node.lineno
+        
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = node.name
+            # Include decorators in the start line
+            if node.decorator_list:
+                start_line = node.decorator_list[0].lineno
+        elif isinstance(node, ast.ClassDef):
+            name = node.name
+            # Include decorators in the start line  
+            if node.decorator_list:
+                start_line = node.decorator_list[0].lineno
+        elif isinstance(node, ast.Assign):
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                name = node.targets[0].id
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                name = node.target.id
+        
+        if name and hasattr(node, 'end_lineno'):
+            end_line = node.end_lineno or node.lineno
+            decls.append((name, start_line, end_line))
+    
+    # Extract code text for each declaration
+    lines = src.splitlines()
+    result = []
+    for name, start_line, end_line in decls:
+        start_idx = start_line - 1
+        end_idx = end_line
+        
+        if start_idx >= 0 and end_idx <= len(lines):
+            code_lines = lines[start_idx:end_idx]
+            code_text = '\n'.join(code_lines)
+            if not code_text.endswith('\n'):
+                code_text += '\n'
+            result.append((name, code_text))
+    
+    return result
+
+def remove_declaration(file_path: str, target_path: str) -> None:
+    """
+    Strictly REMOVE a function/class/assignment designated by target_path from file_path.
+    - No replacement is allowed here (use declare() for additions/updates).
+    - Raises ValueError if the target is not found.
+
+    Args:
+        file_path: Path to the Python source file to modify
+        target_path: Dotted lexical path like "ClassName.method_name" or "CONST_NAME"
+    """
+    # Track file for git operations BEFORE modifying it
+    if hasattr(remove_declaration, '_rollback_manager'):
+        remove_declaration._rollback_manager.track_file(file_path)
+
+    with open(file_path, 'r') as f:
+        content = f.read()
+
+    target_name, lexical_chain = parse_lexical_chain(target_path)
+
+    new_content, removed = remove_block(content, target_name, lexical_chain)
+    if not removed:
+        error_msg = (
+            f"remove_declaration(): target '{target_name}' not found at "
+            f"{'.'.join(lexical_chain) or '<module>'} in {file_path}"
+        )
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+
+    with open(file_path, 'w') as f:
+        f.write(new_content)
+
+
+def declare(file_path, target_path, new_code=None):
+    """
+    Declare/Update a function, class, or assignment in a file with lexical-chain support.
+
+    IMPORTANT:
+      * This function NOW REQUIRES NON-EMPTY CODE. If you want to delete, call remove_declaration().
+      * "Empty in any sense" means:
+          - new_code is None
+          - new_code is all whitespace after dedent
+          - new_code parses to an empty module (e.g., only comments/blank lines)
+          - auto-detected code from target_path is empty by the same criteria
+
+    Extended behaviors (unchanged):
+      - If target_path looks like code (contains 'def', 'class', '=', or 'async def'),
+        we treat target_path as the declaration and auto-extract the name.
+      - If new_code has multiple declarations, they are applied at the same lexical base path.
+
+    Args:
+        file_path: Path to the file to modify
+        target_path: Dotted path like "ClassName.method" OR the actual code (see above)
+        new_code: Code to insert (optional if target_path contains the code)
+    """
+    # Handle combined path "file.py.Class.method" convenience
+    if '.py.' in file_path:
+        py_index = file_path.index('.py.')
+        actual_file_path = file_path[:py_index + 3]
+        remaining_path = file_path[py_index + 4:]
+        if target_path and any(kw in target_path for kw in ['def ', 'class ', '= ', 'async def ']):
+            new_code = target_path
+            target_path = remaining_path
+            file_path = actual_file_path
+            logging.info(f"Extracted filepath '{file_path}' and target '{target_path}' from combined path")
+        else:
+            target_path = remaining_path
+            file_path = actual_file_path
+            logging.info(f"Extracted filepath '{file_path}' and target '{target_path}' from combined path")
+
+    # If caller passed the declaration in target_path, auto-extract the name
+    if new_code is None and target_path and any(kw in target_path for kw in ['def ', 'class ', '= ', 'async def ']):
+        dedented_code = textwrap.dedent(target_path)
+        if dedented_code.strip() == "":
+            raise ValueError("declare(): empty code detected (after dedent). Use remove_declaration() for deletions.")
+        try:
+            tree = ast.parse(dedented_code)
+            if not getattr(tree, "body", None):  # empty module => only comments/whitespace
+                raise ValueError("declare(): code parses to an empty module (likely only comments/whitespace).")
+            # Extract a sensible default name
+            extracted = False
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    target_path = node.name
+                    extracted = True
+                    break
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    nm = None
+                    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                        nm = node.targets[0].id
+                    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                        nm = node.target.id
+                    if nm:
+                        target_path = nm
+                        extracted = True
+                        break
+            if not extracted:
+                raise ValueError("declare(): could not extract a target name from the provided code.")
+        except SyntaxError as e:
+            raise ValueError(f"declare(): provided code failed to parse: {e}")
+        new_code = dedented_code
+
+    # From here on, new_code must be present and non-empty in every meaningful sense
+    if new_code is None:
+        raise ValueError("declare(): missing code. Use remove_declaration() for deletions.")
+
+    new_code = textwrap.dedent(new_code)
+    if new_code.strip() == "":
+        raise ValueError("declare(): empty code after dedent. Use remove_declaration() for deletions.")
+
+    try:
+        parsed = ast.parse(new_code)
+    except SyntaxError as e:
+        raise ValueError(f"declare(): code failed to parse: {e}")
+
+    if not getattr(parsed, "body", None):
+        # Only comments/whitespace
+        raise ValueError("declare(): code parses to an empty module (only comments/whitespace).")
+
+    # Track file for git operations BEFORE modifying it
+    if hasattr(declare, '_rollback_manager'):
+        declare._rollback_manager.track_file(file_path)
+
+    with open(file_path, 'r') as f:
+        content = f.read()
+
+    target_name, lexical_chain = parse_lexical_chain(target_path)
+
+    # Extract top-level declarations from the provided code (to support multi-decl payloads)
+    decls = _extract_declarations_with_parents(new_code)
+    if len(decls) == 0:
+        raise ValueError("declare(): no top-level function/class/assignment found in code payload.")
+
+    # If we only found one declaration, keep the original single-target behavior
+    if len(decls) <= 1:
+        # For assignments, prefer remove+insert fallback
+        if target_name in content and '=' in new_code:
+            c2, removed = remove_block(content, target_name, lexical_chain)
+            if removed:
+                new_content = insert_block(c2, new_code, target_name=target_name, lexical_chain=lexical_chain)
+            else:
+                new_content = insert_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+        else:
+            # Use replace path for defs/classes
+            new_content, was_replaced = replace_block(
+                content, new_code, target_name=target_name, lexical_chain=lexical_chain
+            )
+            if not was_replaced:
+                new_content = insert_block(content, new_code, target_name=target_name, lexical_chain=lexical_chain)
+
+        with open(file_path, 'w') as f:
+            f.write(new_content)
+        return
+
+    # Multi-declaration path: apply target-matching decl first, then the rest
+    new_content = content
+    first_idx = 0
+    for i, (nm, _) in enumerate(decls):
+        if nm == target_name:
+            first_idx = i
+            break
+
+    first_decl = decls[first_idx]
+    rest_decls = decls[:first_idx] + decls[first_idx + 1:]
+
+    def _apply_one(curr_content: str, nm: str, code_text: str) -> str:
+        if nm in curr_content and '=' in code_text:
+            c2, removed = remove_block(curr_content, nm, lexical_chain)
+            if removed:
+                return insert_block(c2, code_text, target_name=nm, lexical_chain=lexical_chain)
+            return insert_block(curr_content, code_text, target_name=nm, lexical_chain=lexical_chain)
+        else:
+            c2, was_replaced = replace_block(curr_content, code_text, target_name=nm, lexical_chain=lexical_chain)
+            if not was_replaced:
+                c2 = insert_block(curr_content, code_text, target_name=nm, lexical_chain=lexical_chain)
+            return c2
+
+    new_content = _apply_one(new_content, first_decl[0], first_decl[1])
+    for nm, code_text in rest_decls:
+        new_content = _apply_one(new_content, nm, code_text)
+
+    with open(file_path, 'w') as f:
+        f.write(new_content)
+
+
+
+# Example usage
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == 'rollback':
+        interactive_rollback()
