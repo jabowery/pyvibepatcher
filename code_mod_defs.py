@@ -621,167 +621,6 @@ class ReplaceDeclaration(cst.CSTTransformer):
         return updated_node
 
 
-def replace_block(content: str,
-                  new_code: str,
-                  target_name: Optional[str] = None,
-                  kind: Optional[str] = None,
-                  lexical_chain: Optional[List[str]] = None) -> tuple[str, bool]:
-    """
-    Replace a function, class, or assignment in `content` with `new_code` using LibCST.
-    - If `target_name`/`kind` are omitted, they are inferred from `new_code`.
-    - lexical_chain specifies the containment hierarchy (e.g., ['ClassName'] for a method)
-    - Handles multiple statements in new_code by extracting the target def/class/assignment
-    
-    Returns:
-        tuple: (modified_content, was_replaced)
-    """
-    # Parse new_code
-    mod = cst.parse_module(new_code)
-    
-    # Initialize variables to avoid UnboundLocalError
-    replacement_node = None
-    inferred_kind = None
-    inferred_name = None
-    
-#    # Handle different cases based on content of new_code
-#    if len(mod.body) == 0:
-#        raise ValueError("new_code cannot be empty.")
-
-    if len(new_code.strip()) == 0:
-        # Delete target instead of raising an error
-        if not target_name:
-            raise ValueError("Cannot delete without target_name.")
-        stripped, _ = remove_block(content, target_name, lexical_chain or [])
-        return stripped, True
-
-    if len(mod.body) == 0:
-        raise ValueError("new_code cannot be empty (after parsing).")
-
-    elif len(mod.body) == 1:
-        # Original behavior - single statement
-        node = mod.body[0]
-        
-        if isinstance(node, cst.FunctionDef):
-            replacement_node = node
-            inferred_kind = "def"
-            inferred_name = node.name.value
-        elif isinstance(node, cst.ClassDef):
-            replacement_node = node
-            inferred_kind = "class"
-            inferred_name = node.name.value
-        elif isinstance(node, cst.SimpleStatementLine):
-            # Check if it's an assignment
-            if (len(node.body) == 1):
-                if (isinstance(node.body[0], cst.Assign) or isinstance(node.body[0], cst.AnnAssign)):
-                    assign_node = node.body[0]
-                    if (isinstance(node.body[0], cst.Assign)):
-                        if (len(assign_node.targets) == 1 and 
-                            isinstance(assign_node.targets[0].target, cst.Name)):
-                            replacement_node = node
-                            inferred_kind = "assign"
-                            inferred_name = assign_node.targets[0].target.value
-                        else:
-                            raise ValueError("new_code must contain a simple assignment to a single variable.")
-                    else:
-                        target = assign_node.target
-                        if (isinstance(target, cst.Name)):
-                            replacement_node = node
-                            inferred_kind = "assign"
-                            inferred_name = target.value
-                        else:
-                            raise ValueError("Annotated assignment malformed.")
-                else:
-                    logging.debug(f"content: {content}")
-                    logging.debug(f"new_code: {new_code}")
-                    raise ValueError("new_code must contain a function, class, or assignment definition.")
-            else:
-                logging.debug(f"content: {content}")
-                logging.debug(f"new_code: {new_code}")
-                raise ValueError("new_code must contain a function, class, or assignment definition.")
-        else:
-            logging.debug(f"content: {content}")
-            logging.debug(f"new_code: {new_code}")
-            raise ValueError("new_code must contain a function, class, or assignment definition.")
-    
-    else:
-        # Multiple statements - find the target def/class/assignment
-        # If target_name is provided, look for it specifically
-        if target_name:
-            for node in mod.body:
-                if isinstance(node, (cst.FunctionDef, cst.ClassDef)):
-                    if node.name.value == target_name:
-                        replacement_node = node
-                        inferred_kind = "def" if isinstance(node, cst.FunctionDef) else "class"
-                        inferred_name = node.name.value
-                        break
-                elif isinstance(node, cst.SimpleStatementLine):
-                    if (len(node.body) == 1 and isinstance(node.body[0], cst.Assign)):
-                        assign_node = node.body[0]
-                        for target in assign_node.targets:
-                            if isinstance(target.target, cst.Name) and target.target.value == target_name:
-                                replacement_node = node
-                                inferred_kind = "assign"
-                                inferred_name = target_name
-                                break
-                        if replacement_node:
-                            break
-        
-        # If not found or no target_name provided, use the first def/class/assignment
-        if replacement_node is None:
-            for node in mod.body:
-                if isinstance(node, (cst.FunctionDef, cst.ClassDef)):
-                    replacement_node = node
-                    inferred_kind = "def" if isinstance(node, cst.FunctionDef) else "class"
-                    inferred_name = node.name.value
-                    break
-                elif isinstance(node, cst.SimpleStatementLine):
-                    if (len(node.body) == 1 and isinstance(node.body[0], cst.Assign)):
-                        assign_node = node.body[0]
-                        if (len(assign_node.targets) == 1 and 
-                            isinstance(assign_node.targets[0].target, cst.Name)):
-                            replacement_node = node
-                            inferred_kind = "assign"
-                            inferred_name = assign_node.targets[0].target.value
-                            break
-        
-        if replacement_node is None:
-            raise ValueError("new_code must contain at least one function, class, or assignment definition.")
-    
-    # Use provided parameters or infer from the found node
-    kind = kind or inferred_kind
-    target_name = target_name or inferred_name
-    
-    # Perform the replacement using only the replacement_node
-    module = cst.parse_module(content)
-    
-    # Create a version of new_code with just the replacement node for the transformer
-    single_node_code = cst.Module(body=[replacement_node]).code
-
-    transformer = ReplaceDeclaration(
-        target_name=target_name,
-        lexical_chain=lexical_chain or [],
-        new_code=single_node_code,
-        kind=kind,
-    )
-    module = cst.parse_module(content)
-    new_module = module.visit(transformer)
-
-    # Primary path result
-    if transformer.replaced:
-        return new_module.code, True
-
-    # If the target exists but we didn't mark replaced, do a robust fallback:
-    if _target_exists(content, target_name, lexical_chain or []):
-        # 1) remove the old target in the right scope
-        stripped, _ = remove_block(content, target_name, lexical_chain or [])
-        # 2) insert the new one
-        inserted = insert_block(stripped, new_code, target_name=target_name, lexical_chain=lexical_chain or [])
-        return inserted, True
-
-    # Otherwise: no target to replace (caller can decide to insert)
-    return content, False
-
-
 def insert_block(content: str,
                  new_code: str,
                  target_name: Optional[str] = None,
@@ -1575,6 +1414,138 @@ def declare(file_path, target_path, new_code=None):
 
     with open(file_path, 'w') as f:
         f.write(new_content)
+def _extract_replacement_node(mod: cst.Module, target_name: Optional[str] = None) -> tuple[Optional[cst.BaseStatement], Optional[str], Optional[str]]:
+    """
+    Extract the replacement node from parsed new_code module.
+
+    Returns:
+        tuple: (replacement_node, inferred_kind, inferred_name)
+    """
+    if len(mod.body) == 0:
+        return None, None, None
+
+    # Try to find the specific target if provided
+    if target_name and len(mod.body) > 1:
+        node_info = _find_node_by_name(mod.body, target_name)
+        if node_info:
+            return node_info
+
+    # Otherwise use the first valid node
+    for node in mod.body:
+        node_info = _extract_node_info(node)
+        if node_info[0] is not None:
+            return node_info
+
+    return None, None, None
+def _find_node_by_name(nodes: List[cst.BaseStatement], target_name: str) -> tuple[Optional[cst.BaseStatement], Optional[str], Optional[str]]:
+    """Find a specific node by name in a list of statements."""
+    for node in nodes:
+        if isinstance(node, cst.FunctionDef):
+            if node.name.value == target_name:
+                return node, "def", target_name
+        elif isinstance(node, cst.ClassDef):
+            if node.name.value == target_name:
+                return node, "class", target_name
+        elif isinstance(node, cst.SimpleStatementLine):
+            assign_name = _extract_assignment_name(node)
+            if assign_name == target_name:
+                return node, "assign", target_name
+    return None, None, None
+def _extract_node_info(node: cst.BaseStatement) -> tuple[Optional[cst.BaseStatement], Optional[str], Optional[str]]:
+    """
+    Extract node information for a single statement.
+
+    Returns:
+        tuple: (node, kind, name) or (None, None, None) if not a valid declaration
+    """
+    if isinstance(node, cst.FunctionDef):
+        return node, "def", node.name.value
+
+    elif isinstance(node, cst.ClassDef):
+        return node, "class", node.name.value
+
+    elif isinstance(node, cst.SimpleStatementLine):
+        name = _extract_assignment_name(node)
+        if name:
+            return node, "assign", name
+
+    return None, None, None
+def _extract_assignment_name(node: cst.SimpleStatementLine) -> Optional[str]:
+    """
+    Extract the variable name from an assignment statement.
+    Returns None if not a valid simple assignment.
+    """
+    if len(node.body) != 1:
+        return None
+
+    stmt = node.body[0]
+
+    if isinstance(stmt, cst.Assign):
+        if len(stmt.targets) == 1 and isinstance(stmt.targets[0].target, cst.Name):
+            return stmt.targets[0].target.value
+
+    elif isinstance(stmt, cst.AnnAssign):
+        if isinstance(stmt.target, cst.Name):
+            return stmt.target.value
+
+    return None
+def replace_block(content: str,
+                  new_code: str,
+                  target_name: Optional[str] = None,
+                  kind: Optional[str] = None,
+                  lexical_chain: Optional[List[str]] = None) -> tuple[str, bool]:
+    """
+    Replace a function, class, or assignment in `content` with `new_code` using LibCST.
+    - If `target_name`/`kind` are omitted, they are inferred from `new_code`.
+    - lexical_chain specifies the containment hierarchy (e.g., ['ClassName'] for a method)
+    - Handles multiple statements in new_code by extracting the target def/class/assignment
+
+    Returns:
+        tuple: (modified_content, was_replaced)
+    """
+    lexical_chain = lexical_chain or []
+
+    # Handle empty new_code as deletion
+    if len(new_code.strip()) == 0:
+        if not target_name:
+            raise ValueError("Cannot delete without target_name.")
+        stripped, _ = remove_block(content, target_name, lexical_chain)
+        return stripped, True
+
+    # Parse and extract the replacement node
+    mod = cst.parse_module(new_code)
+    replacement_node, inferred_kind, inferred_name = _extract_replacement_node(mod, target_name)
+
+    if replacement_node is None:
+        raise ValueError("new_code must contain at least one function, class, or assignment definition.")
+
+    # Use provided parameters or inferred values
+    kind = kind or inferred_kind
+    target_name = target_name or inferred_name
+
+    # Perform the replacement
+    single_node_code = cst.Module(body=[replacement_node]).code
+    transformer = ReplaceDeclaration(
+        target_name=target_name,
+        lexical_chain=lexical_chain,
+        new_code=single_node_code,
+        kind=kind,
+    )
+
+    module = cst.parse_module(content)
+    new_module = module.visit(transformer)
+
+    if transformer.replaced:
+        return new_module.code, True
+
+    # Fallback: if target exists but transformer didn't replace it, use remove+insert
+    if _target_exists(content, target_name, lexical_chain):
+        stripped, _ = remove_block(content, target_name, lexical_chain)
+        inserted = insert_block(stripped, new_code, target_name=target_name, lexical_chain=lexical_chain)
+        return inserted, True
+
+    # Target doesn't exist - no replacement performed
+    return content, False
 
 
 
