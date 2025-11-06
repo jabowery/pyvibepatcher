@@ -130,3 +130,4 @@ def baz_function():
 - Before modifications are applied, any uncommitted files are commited to the git repository with a comment 'preparing execute automated modifications' and then try: the apply_modspec after which commit the changes (including any file operations such as add, rm, mv) with a comment determined by the by modification_description. The except should reset to the prior commit.
 - This means all exceptions internal to the processing must re-raise the exception so that the reset can be done.
 - If there is no git repository, the modification system immediately exist without doing any modifications.
+- Previously untracked files should not be added to the repo unless they were among the file paths in the modification set.

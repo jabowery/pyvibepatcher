@@ -1,7 +1,0 @@
-MMM declare MMM
-my.py
-@@@@@@
-foo.bar
-@@@@@@
-def bar():
-    print('hi')

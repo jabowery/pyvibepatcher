@@ -1,276 +1,361 @@
-#!/usr/bin/env python3
-"""
-Robust modification-file parser for the MMM ... MMM / @@@@@@ format.
-
-Key improvements:
-- Separator detection treats any line whose strip() equals '@@@@@@' as a split.
-- Guardrails for declare-style operations:
-  * update_declaration -> MUST have non-empty content (never delete).
-  * remove_declaration -> dedicated function; MUST NOT have content (always delete).
-  * declare -> legacy semantics: empty content => delete; non-empty => add/update.
-- Clearer error messages for misuse, preventing accidental deletions.
-- **NEW**: First split the entire file into ^MMM command blocks before processing.
-"""
-
-from __future__ import annotations
-
-import sys
+import ast
+import os
 import re
-from pathlib import Path
-from typing import List, Tuple, Any
+import shutil
+import sys
+import subprocess
 
-from code_mod_defs import (
-    apply_modification_set,
-    modification_description,
-    create_file,
-    move_file,
-    declare,
-    replace_file_contents,
-    make_directory,
-    remove_file,
-    update_header,
-    remove_declaration,       # NEW: import dedicated function
-    interactive_rollback,     # assumed to exist in your environment
-)
 
-# Matches lines like: MMM function_name MMM
-_HEADER_RE = re.compile(r'^MMM\s+([A-Za-z_][A-Za-z0-9_]*)\s+MMM\s*')
+def run_git(cmd, check=True):
+    result = subprocess.run(['git'] + cmd, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        raise RuntimeError(f"Git command failed: {result.stdout + result.stderr}")
+    return result.stdout.strip()
 
-def _parse_bool(s: str) -> bool:
-    s = s.strip().lower()
-    if s in {"true", "1", "yes", "y"}:
-        return True
-    if s in {"false", "0", "no", "n"}:
-        return False
-    # default: treat non-empty as True
-    return bool(s)
 
-def _is_sep_line(ln: str) -> bool:
-    """Return True if the line is a section separator ('@@@@@@'), robust to CRLF and spaces."""
-    return ln.strip() == "@@@@@@"
-
-def _split_sections(block_lines: List[str]) -> List[str]:
+def parse(file_content: str) -> list[tuple[str, list[str]]]:
     """
-    Split a block into text sections using lines whose strip() equals '@@@@@@' as separators.
-    - Preserve inner newlines in each section.
-    - Strip a single trailing newline per section for predictable behavior.
-    - Do NOT drop trailing empty sections here; higher-level logic decides semantics.
+    Parse the ModSpec file content into blocks of (command, sections).
     """
-    sections: List[List[str]] = [[]]
-    for ln in block_lines:
-        if _is_sep_line(ln):
-            sections.append([])
-        else:
-            # Allow escaping a literal '@@@@@@' by prefixing with '\'
-            if ln.startswith('\\@@@@@@'):
-                ln = ln[1:]
-            sections[-1].append(ln)
-
-    out: List[str] = []
-    for sec in sections:
-        txt = "".join(sec)
-        if txt.endswith("\n"):
-            txt = txt[:-1]
-        out.append(txt)
-    return out
-
-
-def _resolve_func(name: str):
-    """
-    Map modification command names to callables.
-    Extend here if you add new commands.
-    """
-    table = {
-        "modification_description": modification_description,
-        "create_file": create_file,
-        "replace_file_contents": replace_file_contents,
-        "move_file": move_file,
-        "make_directory": make_directory,
-        "remove_file": remove_file,
-        "declare": declare,
-        "update_declaration": declare,           # alias
-        "remove_declaration": remove_declaration,
-        "update_header": update_header,
-    }
-    return table.get(name)
-
-
-
-def _has_nonempty_text(s: str | None) -> bool:
-    return s is not None and s.strip() != ""
-
-def _split_command_blocks(lines: List[str]) -> List[Tuple[str, List[str]]]:
-    """
-    First pass: split the entire file into command blocks using ^MMM <name> MMM headers.
-    Returns a list of (func_name, block_lines) where block_lines excludes the header
-    and runs up to (but not including) the next header (or EOF).
-    """
-    blocks: List[Tuple[str, List[str]]] = []
+    lines = file_content.splitlines(keepends=True)
+    blocks = []
     i = 0
-    current_name: str | None = None
-    current_block: List[str] = []
-
+    header_re = re.compile(r'^\s*MMM\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+MMM\s*$')
+    sep = '@@@@@@'
+    escape = r'\\@@@@@@'
+    
     while i < len(lines):
-        m = _HEADER_RE.match(lines[i])
+        line = lines[i]
+        m = header_re.match(line)
         if m:
-            # Commit the previous block if any
-            if current_name is not None:
-                blocks.append((current_name, current_block))
-            # Start a new block
-            current_name = m.group(1)
-            current_block = []
+            cmd = m.group(1)
+            i += 1
+            body_lines = []
+            while i < len(lines):
+                next_line = lines[i]
+                if header_re.match(next_line):
+                    break
+                body_lines.append(next_line)
+                i += 1
+            
+            # Parse body into sections
+            sections = []
+            current_section = []
+            for bl in body_lines:
+                stripped = bl.strip()
+                if stripped == sep:
+                    sections.append(''.join(current_section))
+                    current_section = []
+                else:
+                    # Apply escape replacement
+                    bl = bl.replace(escape, sep)
+                    current_section.append(bl)
+            if current_section:
+                sections.append(''.join(current_section))
+            
+            blocks.append((cmd, sections))
         else:
-            if current_name is not None:
-                current_block.append(lines[i])
-        i += 1
-
-    # Commit the trailing block
-    if current_name is not None:
-        blocks.append((current_name, current_block))
-
+            i += 1  # Skip non-header lines
     return blocks
 
-def parse_modification_file(path: str):
-    """
-    Parse the given modification file and return a list of entries:
-        List[Tuple[callable, tuple(args), dict(kwargs)]]
 
-    Format per block:
-        MMM <func_name> MMM
-        <arg or payload...>
-        @@@@@@
-        <next arg...>
-        @@@@@@
-        ... (next block)
-        MMM <func_name> MMM
-        ...
+def is_valid_dotted(t: str) -> bool:
+    name_re = r'[a-zA-Z_][a-zA-Z0-9_]*'
+    pattern = rf'^{name_re}(\.{name_re})*$'
+    return bool(re.match(pattern, t))
 
-    Guardrails for declare-like functions are enforced here so downstream code
-    can't accidentally delete when the intent was to update.
-    """
-    text = Path(path).read_text()
-    lines = text.splitlines(keepends=True)
 
-    entries: List[Tuple[Any, tuple, dict]] = []
+def parse_bool(s: str) -> bool:
+    s = s.lower()
+    if s in ['true', 'yes', 'y', '1']:
+        return True
+    elif s in ['false', 'no', 'n', '0']:
+        return False
+    else:
+        raise ValueError(f"Invalid boolean: {s}")
 
-    # **NEW**: First split the full file into command blocks by MMM headers
-    blocks = _split_command_blocks(lines)
 
-    for func_name, block in blocks:
-        sections = _split_sections(block)
-        fn = _resolve_func(func_name)
-
-        # Special handling for known signatures
-        if fn is modification_description:
-            if not sections:
-                raise ValueError("modification_description requires one section (the description).")
-            args = (sections[0],)
-            kwargs = {}
-
-        elif fn is create_file:
-            if len(sections) < 2:
-                raise ValueError("create_file requires at least 2 sections: path, content, [make_executable].")
-            path_arg = sections[0].strip()
-            content_arg = sections[1]
-            make_exec = _parse_bool(sections[2]) if len(sections) >= 3 else False
-            args = (path_arg, content_arg)
-            kwargs = {"make_executable": make_exec}
-
-        elif fn is replace_file_contents:
-            if len(sections) < 2:
-                raise ValueError("replace_file_contents requires at least 2 sections: path, content, [make_executable].")
-            path_arg = sections[0].strip()
-            content_arg = sections[1]
-            make_exec = _parse_bool(sections[2]) if len(sections) >= 3 else False
-            args = (path_arg, content_arg)
-            kwargs = {"make_executable": make_exec}
-
-        elif fn is move_file:
-            if len(sections) < 2:
-                raise ValueError("move_file requires 2 sections: src, dst.")
-            src = sections[0].strip()
-            dst = sections[1].strip()
-            args = (src, dst)
-            kwargs = {}
-
-        elif fn is declare:
-            # For declare/update_declaration apply guardrails at parse time
-            if len(sections) < 2:
-                raise ValueError(f"{func_name} requires 2+ sections: file_path, target_path, [content].")
-
+def resolve(cmd: str, sections: list[str]):
+    arity = len(sections)
+    if cmd == 'modification_description':
+        if arity != 1:
+            raise ValueError(f"{cmd} requires arity 1")
+        return [sections[0]]
+    elif cmd in ['create_file', 'replace_file_contents']:
+        if arity not in [2, 3]:
+            raise ValueError(f"{cmd} requires arity 2-3")
+        path = sections[0].strip()
+        content = sections[1]
+        make_exec = parse_bool(sections[2].strip()) if arity == 3 else False
+        return [path, content, make_exec]
+    elif cmd == 'move_file':
+        if arity != 2:
+            raise ValueError(f"{cmd} requires arity 2")
+        return [sections[0].strip(), sections[1].strip()]
+    elif cmd == 'make_directory':
+        if arity != 1:
+            raise ValueError(f"{cmd} requires arity 1")
+        return [sections[0].strip()]
+    elif cmd == 'remove_file':
+        if arity != 1:
+            raise ValueError(f"{cmd} requires arity 1")
+        return [sections[0].strip()]
+    elif cmd == 'update_header':
+        if arity != 2:
+            raise ValueError(f"{cmd} requires arity 2")
+        return [sections[0].strip(), sections[1]]
+    elif cmd == 'declare':
+        if arity == 2:
+            # Schema A: shorthand
+            combined = sections[0].strip()
+            m = re.match(r'^(.+?\.py)\.(.+)$', combined)
+            if not m:
+                raise ValueError("Invalid shorthand for declare")
+            file_path = m.group(1)
+            dotted_target = m.group(2)
+            content = sections[1]
+            if not content.strip():
+                raise ValueError("Content must be non-empty")
+            if not is_valid_dotted(dotted_target):
+                raise ValueError("Invalid dotted_target")
+            return [file_path, dotted_target, content]
+        elif arity == 3:
+            # Schema B: explicit
             file_path = sections[0].strip()
-            name = sections[1].strip()
-            content = sections[2] if len(sections) >= 3 else None
-
-            if func_name == "update_declaration":
-                if not _has_nonempty_text(content):
-                    raise ValueError("update_declaration requires a NON-empty content section; it cannot delete. If you intend deletion, use remove_declaration.")
-            else:  # bare 'declare' keeps legacy: empty => delete, non-empty => add/update
-                if content is not None and content.strip() == "":
-                    content = None  # normalize empty-string payload to deletion
-
-            args = (file_path, name, content)
-            kwargs = {}
-
-        elif fn is remove_declaration:
-            # Dedicated deletion primitive: exactly two sections; no content allowed
-            if len(sections) < 2:
-                raise ValueError("remove_declaration requires 2 sections: file_path, target_path (no content).")
-            if len(sections) >= 3 and _has_nonempty_text(sections[2]):
-                raise ValueError("remove_declaration must NOT include a content section. Provide only file_path and target_path.")
-            file_path = sections[0].strip()
-            name = sections[1].strip()
-            args = (file_path, name)
-            kwargs = {}
-
-        elif fn is make_directory:
-            if len(sections) < 1:
-                raise ValueError("make_directory requires 1 section: path.")
-            path_arg = sections[0].strip()
-            args = (path_arg,)
-            kwargs = {}
-
-        elif fn is remove_file:
-            if len(sections) < 1:
-                raise ValueError("remove_file requires at least 1 section: path, [recursive].")
-            path_arg = sections[0].strip()
-            recursive = _parse_bool(sections[1]) if len(sections) >= 2 else False
-            args = (path_arg,)
-            kwargs = {"recursive": recursive}
-
-        elif fn is update_header:
-            if len(sections) < 2:
-                raise ValueError("update_header requires 2 sections: file_path, header_content.")
-            file_path_arg = sections[0].strip()
-            header_content_arg = sections[1]
-            args = (file_path_arg, header_content_arg)
-            kwargs = {}
-
+            dotted_target = sections[1].strip()
+            content = sections[2]
+            if not content.strip():
+                raise ValueError("Content must be non-empty")
+            if not is_valid_dotted(dotted_target):
+                raise ValueError("Invalid dotted_target")
+            return [file_path, dotted_target, content]
         else:
-            # Fallback: pass all sections as positional strings
-            args = tuple(sections)
-            kwargs = {}
+            raise ValueError("declare requires arity 2 or 3")
+    elif cmd == 'update_declaration':
+        if arity != 3:
+            raise ValueError("update_declaration requires arity 3")
+        file_path = sections[0].strip()
+        dotted_target = sections[1].strip()
+        content = sections[2]
+        if not content.strip():
+            raise ValueError("Content must be non-empty")
+        if not is_valid_dotted(dotted_target):
+            raise ValueError("Invalid dotted_target")
+        return [file_path, dotted_target, content]
+    elif cmd == 'remove_declaration':
+        if arity != 2:
+            raise ValueError("remove_declaration requires arity 2")
+        file_path = sections[0].strip()
+        dotted_target = sections[1].strip()
+        if not is_valid_dotted(dotted_target):
+            raise ValueError("Invalid dotted_target")
+        return [file_path, dotted_target]
+    else:
+        raise ValueError(f"Unknown command: {cmd}")
 
-        entries.append((fn, args, kwargs))
 
-    if not entries:
-        raise ValueError("No modification blocks found in file.")
+def get_scope(tree: ast.AST, parts: list[str]):
+    current = tree
+    for part in parts[:-1]:
+        found = None
+        for node in current.body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == part:
+                found = node
+                break
+        if found is None:
+            return None
+        current = found
+    return current.body
 
-    return entries
 
-def main():
-    if len(sys.argv) == 2 and sys.argv[1] == 'rollback':
-        interactive_rollback()
-        return
+def modify_declaration(file_path: str, dotted_target: str, content: str | None, remove: bool):
+    if not os.path.exists(file_path):
+        if remove:
+            return
+        else:
+            raise FileNotFoundError(f"File not found: {file_path}")
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        source = f.read()
+    
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        raise ValueError(f"AST parse error in {file_path}") from e
+    
+    parts = dotted_target.split('.')
+    if not parts:
+        raise ValueError("Invalid dotted_target")
+    
+    scope = get_scope(tree, parts)
+    if scope is None:
+        if remove:
+            return
+        else:
+            raise ValueError(f"Parent scope not found for {dotted_target} in {file_path}")
+    
+    name = parts[-1]
+    new_node = None
+    if not remove:
+        try:
+            content_module = ast.parse(content)
+        except SyntaxError as e:
+            raise ValueError("Invalid content syntax") from e
+        
+        if not isinstance(content_module, ast.Module) or len(content_module.body) != 1:
+            raise ValueError("Content must be a single declaration")
+        
+        decl = content_module.body[0]
+        if not isinstance(decl, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            raise ValueError("Content must be a class or function definition")
+        
+        if decl.name != name:
+            raise ValueError(f"Name mismatch: expected {name}, got {decl.name}")
+        
+        new_node = decl
+    
+    # Find existing declarations
+    existing_indices = []
+    for i, node in enumerate(scope):
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            existing_indices.append(i)
+    
+    # Remove existing
+    for i in sorted(existing_indices, reverse=True):
+        del scope[i]
+    
+    if not remove:
+        # Determine insertion position
+        pos = len(scope)
+        if existing_indices:
+            pos = min(existing_indices)
+        else:
+            for i, node in enumerate(scope):
+                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    pos = i
+                    break
+        
+        scope.insert(pos, new_node)
+    
+    # Write back
+    new_source = ast.unparse(tree)
+    with open(file_path, 'w', encoding='utf-8') as f:
+        f.write(new_source + '\n')
 
+
+def execute(cmd: str, args):
+    if cmd == 'modification_description':
+        pass  # Descriptive, no action
+    elif cmd in ['create_file', 'replace_file_contents']:
+        path, content, make_exec = args
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        if make_exec:
+            if not sys.platform.startswith('win'):
+                os.chmod(path, 0o755)
+    elif cmd == 'move_file':
+        src, dst = args
+        shutil.move(src, dst)
+    elif cmd == 'make_directory':
+        path = args[0]
+        os.makedirs(path)
+    elif cmd == 'remove_file':
+        path = args[0]
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        elif os.path.isfile(path):
+            os.remove(path)
+        else:
+            raise FileNotFoundError(f"No such file or directory: {path}")
+    elif cmd == 'update_header':
+        file_path, new_header = args
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        with open(file_path, 'r', encoding='utf-8') as f:
+            source = f.read()
+        try:
+            tree = ast.parse(source)
+        except SyntaxError as e:
+            raise ValueError(f"AST parse error in {file_path}") from e
+        decl_nodes = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))]
+        if not decl_nodes:
+            # No declarations, replace whole file
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(new_header + '\n')
+            return
+        first_decl_lineno = min(node.lineno for node in decl_nodes)
+        lines = source.splitlines(keepends=True)
+        decl_and_after = lines[first_decl_lineno - 1:]
+        new_header_lines = new_header.splitlines(keepends=True)
+        if new_header and not new_header.endswith(('\n', '\r\n')):
+            new_header_lines[-1] += '\n'
+        new_source = ''.join(new_header_lines + decl_and_after)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(new_source)
+    elif cmd in ['declare', 'update_declaration']:
+        file_path, dotted_target, content = args
+        modify_declaration(file_path, dotted_target, content, remove=False)
+    elif cmd == 'remove_declaration':
+        file_path, dotted_target = args
+        modify_declaration(file_path, dotted_target, None, remove=True)
+
+
+def apply_modspec(spec_file: str):
+    with open(spec_file, 'r', encoding='utf-8') as f:
+        content = f.read()
+    blocks = parse(content)
+    
+    descriptions = []
+    touched = set()
+    for cmd, sections in blocks:
+        args = resolve(cmd, sections)
+        if cmd == 'modification_description':
+            descriptions.append(args[0])
+        else:
+            if cmd in ['create_file', 'replace_file_contents', 'make_directory', 'remove_file', 'update_header', 'declare', 'update_declaration', 'remove_declaration']:
+                touched.add(args[0])
+            elif cmd == 'move_file':
+                touched.add(args[0])
+                touched.add(args[1])
+    
+    desc = '\n'.join(descriptions).strip()
+    if not desc:
+        desc = "Automated modifications"
+    
+    # Git preparation
+    prior_commit = run_git(['rev-parse', 'HEAD'])
+    status = run_git(['status', '--porcelain'])
+    has_tracked_changes = any(not line.startswith('??') for line in status.splitlines() if line)
+    if has_tracked_changes:
+        run_git(['add', '-u'])
+        run_git(['commit', '-m', 'preparing to execute automated modifications'])
+    
+    try:
+        # Execute non-description commands
+        for cmd, sections in blocks:
+            if cmd != 'modification_description':
+                args = resolve(cmd, sections)
+                execute(cmd, args)
+        
+        # Stage changes for touched paths
+        for path in touched:
+            run_git(['add', path], check=False)
+        
+        # Commit changes if any
+        try:
+            run_git(['commit', '-m', desc])
+        except RuntimeError as e:
+            if 'nothing to commit' in str(e):
+                pass
+            else:
+                raise
+    except Exception as e:
+        run_git(['reset', '--hard', prior_commit])
+        raise
+
+
+if __name__ == '__main__':
     if len(sys.argv) != 2:
-        print("Usage: python modify_code.py <modification_file>\n       python modify_code.py rollback")
+        print("Usage: python -m modspec <spec_file>")
         sys.exit(1)
-
-    modification_file = sys.argv[1]
-    modifications = parse_modification_file(modification_file)
-    manager = apply_modification_set(modifications)
-    print("\nModifications complete. Use 'python modify_code.py rollback' for rollback options.")
-
-if __name__ == "__main__":
-    main()
+    apply_modspec(sys.argv[1])

@@ -1,4 +1,4 @@
-name: pyvibepatcher
+name: vibemod
 channels:
   - conda-forge
   - defaults

@@ -5,15 +5,15 @@ See [prompt.txt](prompt.txt) that prompts the LLM coding assistant to provide mo
 Given a modification directives file named "fixes.txt":
 
 ```
-(pyvibepatcher) $ python path_to/pyvibepatcher/modify_code.py fixes.txt
+(vibemod) $ python path_to/vibemod/modify_code.py fixes.txt
 ```
 
-The (pyvibepatcher) indicates you have already:
+The (vibemod) indicates you have already:
 
 ```
-cd pyvibepatcher
+cd vibemod
 $ mamba env create -f environment.yml
-$ mamba activate pyvibepatcher
+$ mamba activate vibemod
 ```
 
 Also:
@@ -29,6 +29,6 @@ The race is on to make money coding fast enough to keep up with the increasing c
 
 The problem with any of the above is that the LLMs, while quite good at providing straight python syntax, are notoriously bad at the meta-syntax of code changes.  For example, they virtually never get the "unified diff" patch syntax correct.  They'll frequently try to provide an executable Python or shell script that does the patch to the Python source you're editing.  But then they'll make a mess of things like escaping quotes that are inside the Python source they're trying to convey to the patch script... etc.
 
-So the aforelinked prompt.txt tells the LLMCA to use a simple, relatively bullet-proof meta-syntax.  Even then there are a wide variety of failure modes the LLMCAs fall into due to their idiosyncratic "psychology".  `modify_code.py` attempts to compensate for these failure modes as best it can based on a good deal of "eat your own dogfood" coding the author has done with this tool -- including using it to code pyvibepatcher itself.
+So the aforelinked prompt.txt tells the LLMCA to use a simple, relatively bullet-proof meta-syntax.  Even then there are a wide variety of failure modes the LLMCAs fall into due to their idiosyncratic "psychology".  `modify_code.py` attempts to compensate for these failure modes as best it can based on a good deal of "eat your own dogfood" coding the author has done with this tool -- including using it to code vibemod itself.
 
 \* The file modification directives are language independent.
