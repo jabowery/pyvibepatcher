@@ -1,3 +1,7 @@
+# Deprecated Repository
+
+Instead, use https://github.com/jabowery/vibemod
+
 # TLDR
 
 See [prompt.txt](prompt.txt) that prompts the LLM coding assistant to provide modification directives.
